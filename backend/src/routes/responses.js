@@ -292,11 +292,14 @@ router.get('/stats/student/:studentId', async (req, res) => {
     const totalPoints = responses.reduce((sum, r) => sum + r.points, 0)
     const average = pollsTaken > 0 ? Math.round((totalPoints / (pollsTaken * 100)) * 100) : 0
 
-    // Count launched polls: questions with 'approved' status (approved & launched to students)
-    // Use allRoomIds (RoomMember + Response unique) to count ALL rooms student participated in
+    // Count launched polls: only questions that were actually run (status 'active'
+    // or 'closed') in rooms where the student has responded at least once.
+    // Using 'approved' counted every drafted question, inflating the missed count.
+    // Using uniqueRoomIdsFromResponse (rooms with actual responses) ensures we
+    // don't count questions from rooms the student joined but never participated in.
     const launchedCount = await Question.countDocuments({
-      roomId: { $in: allRoomIds },
-      status: 'approved'
+      roomId: { $in: uniqueRoomIdsFromResponse },
+      status: { $in: ['active', 'closed'] }
     })
     const pollsMissed = Math.max(0, launchedCount - pollsTaken)
 
