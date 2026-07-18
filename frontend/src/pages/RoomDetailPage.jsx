@@ -14,7 +14,7 @@ import RoomSettingsModal from '../components/RoomSettingsModal'
 import Leaderboard from '../components/Leaderboard'
 import { saveTranscript } from '../services/transcriptService'
 import { transcribeAudio, getTranscriptionStatus, convertWebMToWav } from '../services/serverTranscriptionService'
-import { requestQuestionGeneration } from '../services/questionService'
+import { requestQuestionGeneration, fetchAllRoomQuestions } from '../services/questionService'
 import { API_URL } from '../config.js'
 
 function RoomDetailPage() {
@@ -78,6 +78,7 @@ function RoomDetailPage() {
   const [isPopupOpen, setIsPopupOpen] = useState(false)
   const [showCreateQuestion, setShowCreateQuestion] = useState(false)
   const [showTextToQuestions, setShowTextToQuestions] = useState(false)
+  const [pastedText, setPastedText] = useState('') // preserved so a failed generation can reopen the popup with the text intact
   const [isGeneratingFromText, setIsGeneratingFromText] = useState(false)
   const [showTextQuestionPopup, setShowTextQuestionPopup] = useState(false)
   const [showGeneratingPopup, setShowGeneratingPopup] = useState(false)
@@ -149,15 +150,16 @@ function RoomDetailPage() {
     }
   }, [socket])
 
-  // Phase 1: answer counts now arrive (absolute, server-computed) inside the throttled
-  // 'leaderboard:updated' payload, instead of a per-response 'response:new' increment.
+  // Answer counts arrive live (absolute, server-computed) on the throttled 'counts:updated'
+  // event. This is now separate from the ranked leaderboard, which is deferred to a quiet-
+  // debounce so its heavy recompute stays out of the answer burst.
   useEffect(() => {
     if (!socket) return
-    const handleLiveUpdate = (payload) => {
+    const handleCounts = (payload) => {
       if (payload?.counts) setAnswerCounts(payload.counts)
     }
-    socket.on('leaderboard:updated', handleLiveUpdate)
-    return () => socket.off('leaderboard:updated', handleLiveUpdate)
+    socket.on('counts:updated', handleCounts)
+    return () => socket.off('counts:updated', handleCounts)
   }, [socket])
 
   // Listen for question launch events to show timer to teacher
@@ -348,42 +350,36 @@ function RoomDetailPage() {
       return
     }
 
-    // Save transcript to database before generating questions.
-    try {
-      await saveTranscript(room._id, currentSegment, textToUse, roomSettings.segmentTime * 60)
-      console.log('[SEGMENT] Transcript saved to DB')
-    } catch (err) {
-      console.error('[SEGMENT] Failed to save transcript:', err)
-      window.alert('Transcript could not be saved. Please try generating questions manually after checking the connection.')
-      setGenerateQEnabled(true)
-      return
-    }
-
-    // Auto-generate questions
+    // Auto-generate questions FIRST. The transcript save is intentionally NOT done before this and
+    // never gates generation — a failed/hung transcript POST used to abort the whole segment with no
+    // questions. We save the transcript only after questions are produced (below), fire-and-forget.
+    let generated = null
     try {
       console.log('[SEGMENT] Auto-generating questions...')
-      const questions = await generateQuestionsFromText(textToUse, currentSegment)
-      if (questions && questions.length > 0) {
-        setPendingQuestions(questions)
-        setShowQuestionPopup(true)
-        setIsPopupOpen(true)
-      }
+      generated = await generateQuestionsFromText(textToUse, currentSegment)
     } catch (error) {
       console.error('[SEGMENT] First generation attempt failed:', error)
       // Auto-retry once
       try {
         console.log('[SEGMENT] Retrying question generation...')
-        const questions = await generateQuestionsFromText(textToUse, currentSegment)
-        if (questions && questions.length > 0) {
-          setPendingQuestions(questions)
-          setShowQuestionPopup(true)
-          setIsPopupOpen(true)
-        }
+        generated = await generateQuestionsFromText(textToUse, currentSegment)
       } catch (retryError) {
         console.error('[SEGMENT] Retry also failed:', retryError)
         window.alert('Failed to generate questions after retry. You can use the manual "Generate Q" button.')
         setGenerateQEnabled(true) // Enable fail-safe manual button
+        return
       }
+    }
+
+    if (generated && generated.length > 0) {
+      setPendingQuestions(generated)
+      setShowQuestionPopup(true)
+      setIsPopupOpen(true)
+      // Questions are in hand and the review popup is up — NOW persist the transcript, fire-and-forget
+      // so a slow/failed/hung save can never block the pipeline or lose the generated questions.
+      // source defaults to 'audio' (real segment).
+      saveTranscript(room._id, currentSegment, textToUse, roomSettings.segmentTime * 60)
+        .catch((err) => console.error('[SEGMENT] Failed to save transcript (questions already generated):', err))
     }
   }
 
@@ -449,14 +445,28 @@ function RoomDetailPage() {
         }))
         setPendingTextQuestions(markedQuestions)
         setShowTextQuestionPopup(true)
+        // Questions generated and the review popup is up — NOW persist the pasted source text,
+        // fire-and-forget so a slow/failed/hung save can never block or delay generation. A paste
+        // has no segment → source='paste' + sentinel segmentIndex -1 (never collides with audio).
+        saveTranscript(room._id, -1, text, 0, 'paste')
+          .catch((err) => console.error('[PASTE] Failed to save transcript (questions already generated):', err))
       } else {
+        // Generation failed — keep the pasted text and reopen the paste popup so the teacher can
+        // retry without re-pasting (the popup unmounts on close, so its own text is otherwise lost).
+        setPastedText(text)
+        setShowTextToQuestions(true)
         window.alert(data.error || 'Failed to generate questions. Please try again.')
       }
     } catch (error) {
       setIsGeneratingFromText(false)
       setShowGeneratingPopup(false) // Close generating popup
       console.error('Text to questions error:', error)
-      window.alert('Failed to generate questions. Please try again.')
+      if (error.name !== 'AbortError') {
+        // Same as above — preserve the pasted text and reopen the popup for a retry.
+        setPastedText(text)
+        setShowTextToQuestions(true)
+        window.alert('Failed to generate questions. Please try again.')
+      }
     }
   }
 
@@ -483,17 +493,10 @@ function RoomDetailPage() {
 
   const loadQuestions = async (rid) => {
     try {
-      const response = await fetch(`${API_URL}/questions?roomId=${rid}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      })
-      if (response.ok) {
-        const data = await response.json()
-        if (data.questions) {
-          setGeneratedQuestions(data.questions)
-        }
-      }
+      // Load ALL questions (pages past the API's 50/page cap) so large rooms show every question,
+      // not just the first 50.
+      const questions = await fetchAllRoomQuestions(rid)
+      setGeneratedQuestions(questions)
       // Also load answer counts
       const countsRes = await fetch(`${API_URL}/responses/counts/${rid}`, {
         headers: { 'Authorization': `Bearer ${token}` }
@@ -766,12 +769,19 @@ function RoomDetailPage() {
     setGenerateQEnabled(false)
 
     try {
-      const questions = await generateQuestionsFromText(textToUse, currentSegment + 1)
+      // Manual "Generate Q" is the fail-safe RETRY of the CURRENT segment's automatic generation, so
+      // it targets `currentSegment` (matching handleSegmentComplete) and does NOT advance the counter
+      // — it re-does segment N, it does not move to N+1 (the next segment is bumped later by
+      // startRecording when the teacher resumes).
+      const questions = await generateQuestionsFromText(textToUse, currentSegment)
       if (questions && questions.length > 0) {
         setPendingQuestions(questions)
         setShowQuestionPopup(true)
         setIsPopupOpen(true)
-        setCurrentSegment(prev => prev + 1)
+        // Persist the transcript only once questions exist — fire-and-forget so it never blocks.
+        // Live transcript → source 'audio'; segmentIndex matches the questions (currentSegment).
+        saveTranscript(room._id, currentSegment, textToUse, roomSettings.segmentTime * 60)
+          .catch((err) => console.error('[MANUAL] Failed to save transcript (questions already generated):', err))
       }
     } catch (error) {
       console.error('Manual question generation failed:', error)
@@ -1111,7 +1121,7 @@ function RoomDetailPage() {
             {/* Paste & Generate Button */}
             {!isEnded && (
               <button
-                onClick={() => setShowTextToQuestions(true)}
+                onClick={() => { setPastedText(''); setShowTextToQuestions(true) }}
                 style={{
                   padding: '8px 16px',
                   background: '#10b981',
@@ -1639,6 +1649,7 @@ function RoomDetailPage() {
           onGenerate={handleTextToQuestionsGenerate}
           roomSettings={roomSettings}
           isGenerating={isGeneratingFromText}
+          initialText={pastedText}
         />
       )}
 
