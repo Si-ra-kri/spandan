@@ -166,6 +166,19 @@ function StudentRoomPage() {
     }
   }, [socket, navigate, room?._id])
 
+  // Re-join the socket room on every (re)connection — handles server restarts where
+  // Socket.IO room memberships are wiped. Without this, new_question events are never
+  // delivered to the student after a reconnect because socket.join() was never re-called.
+  useEffect(() => {
+    if (!socket || !room?.code || !user?._id) return
+    const handleReconnect = () => {
+      console.log('[socket] reconnected — re-joining room', room.code)
+      joinRoom(room.code, user._id)
+    }
+    socket.on('connect', handleReconnect)
+    return () => socket.off('connect', handleReconnect)
+  }, [socket, room?.code, user?._id])
+
   const joinSession = async () => {
     setIsLoading(true)
     try {
@@ -885,10 +898,10 @@ function StudentRoomPage() {
           )}
         </div>
       </div>
-      {/* Live risk-score widget pinned to the top-right. Fetches its own
-          updates via the risk-score socket event (server only sends the
-          student's own score to their socket). */}
-      <RiskScoreWidget />
+      {/* Live risk-score widget pinned to the top-right.
+          - roomId + token: hydrates the persisted DB score on mount/refresh.
+          - Also listens for live risk-score:self-update socket events. */}
+      <RiskScoreWidget roomId={room?._id} token={token} />
     </div>
   )
 }

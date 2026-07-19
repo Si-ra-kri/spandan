@@ -1,5 +1,9 @@
 // Live risk-score widget shown to students in StudentRoomPage.
 // Subscribes to `risk-score:self-update` events via useRiskScoreSocket.
+// Also hydrates from the DB on mount (when roomId+token are passed) so the
+// score is correct immediately after a page refresh, not just after a socket
+// event arrives.
+//
 // Color-coded badge:
 //   safe    -> green
 //   warning -> amber
@@ -8,9 +12,10 @@
 // Server is the source of truth: a student socket will only ever receive
 // `risk-score:self-update` for THEIR OWN userId.
 
-import React from 'react'
+import React, { useEffect } from 'react'
 import { useRiskScoreStore } from '../stores/riskScoreStore'
 import { useRiskScoreSocket } from '../hooks/useRiskScoreSocket'
+import { API_URL } from '../config.js'
 
 const ZONE_STYLES = {
   safe: {
@@ -36,9 +41,39 @@ const ZONE_STYLES = {
   }
 }
 
-export default function RiskScoreWidget() {
+export default function RiskScoreWidget({ roomId, token }) {
   useRiskScoreSocket()
   const { currentScore, zone, correctStreakNeeded } = useRiskScoreStore((s) => s.self)
+  const setSelf = useRiskScoreStore((s) => s.setSelf)
+
+  // ── Hydration from DB ────────────────────────────────────────────────────
+  // On mount (and whenever roomId changes), fetch the persisted score so the
+  // widget shows the correct value immediately after a page refresh instead
+  // of starting at 100 and waiting for the next socket event.
+  useEffect(() => {
+    if (!roomId || !token) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`${API_URL}/risk-scores/me/room/${roomId}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        })
+        const data = await res.json()
+        if (cancelled) return
+        if (data?.success) {
+          setSelf({
+            currentScore:        data.currentScore,
+            zone:                data.zone,
+            correctStreakNeeded: data.correctStreakNeeded
+          })
+        }
+      } catch (e) {
+        console.warn('[RiskScoreWidget] hydration failed:', e)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [roomId, token])
+  // ────────────────────────────────────────────────────────────────────────
 
   const z = ZONE_STYLES[zone] || ZONE_STYLES.safe
 

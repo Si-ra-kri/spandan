@@ -118,7 +118,7 @@ export default function StudentRiskTrend() {
             >
               <option value="">— all rooms —</option>
               {rooms.map((r) => (
-                <option key={r._id} value={r._id}>{r.title || r.code} ({r.code})</option>
+                <option key={r._id} value={r._id}>{r.name || r.code} ({r.code})</option>
               ))}
             </select>
           </div>

@@ -1045,7 +1045,7 @@ function RoomDetailPage() {
     <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg-primary)', width: '100vw', maxWidth: '100vw', overflowX: 'hidden' }}>
       <Sidebar user={user} />
 
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', marginLeft: '240px', minWidth: 0, maxWidth: 'calc(100vw - 240px)', overflowX: 'hidden' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', marginLeft: '240px', minWidth: 0, maxWidth: 'calc(100vw - 240px - 288px)', overflowX: 'hidden' }}>
         {/* Header */}
         <header style={{ background: 'var(--header-bg)', color: 'white', padding: '16px 32px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -1783,7 +1783,21 @@ function RoomDetailPage() {
           50% { transform: scale(1.1); }
         }
       `}</style>
-      <HostRiskPanel roomId={roomId} token={token} />
+      {/* Live Risk Scores — sticky right panel, 280px fixed, scrolls with the page */}
+      <div style={{
+        width: '280px',
+        flexShrink: 0,
+        position: 'sticky',
+        top: 0,
+        alignSelf: 'flex-start',
+        height: '100vh',
+        overflowY: 'auto',
+        padding: '16px 12px',
+        borderLeft: '1px solid var(--border-color, #e5e7eb)',
+        background: 'var(--bg-primary)'
+      }}>
+        <HostRiskPanel roomId={roomId} token={token} />
+      </div>
     </div>
   )
 }

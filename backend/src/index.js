@@ -23,7 +23,7 @@ import riskScoreRoutes from './routes/riskScores.js'
 
 // Import models for reference
 import './models/index.js'
-import { Room, User, Response } from './models/index.js'
+import { Room, User, Response, RiskScore } from './models/index.js'
 import {
   applyEvent,
   getRoomRiskSnapshot,
@@ -366,6 +366,7 @@ app.get('/api/health', (req, res) => {
 
 // Socket.IO connection handling
 const connectedUsers = new Map() // socket.id -> userId
+app.set('connectedUsers', connectedUsers)
 
 const SOCKET_JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production'
 
@@ -574,7 +575,6 @@ io.on('connection', (socket) => {
       void doc
     } catch (err) {
       console.error('[risk-score] apply on response:submit failed:', err)
->>>>>>> 12918fb (feat: wire risk score events into socket and question lifecycle)
     }
   })
 
@@ -606,11 +606,13 @@ io.on('connection', (socket) => {
         .lean()
       if (!room) return
 
-      const RoomMember = (await import('./models/RoomMember.js')).default
-      const members = await RoomMember.find({ roomId: room._id })
-        .select('studentId')
-        .lean()
-      if (!members.length) return
+      // Use RiskScore history (not RoomMember) to find participants.
+      // RoomMember records are deleted when students leave the room — so a student
+      // who exits before a question launches would never get the skip penalty.
+      // RiskScore docs persist permanently, so anyone who ever answered or was
+      // skipped in this room is correctly included here.
+      const participantIds = await RiskScore.distinct('studentId', { roomId: room._id })
+      if (!participantIds.length) return
 
       const respondedStudentIds = await Response.find({
         questionId: questionId,
@@ -618,12 +620,12 @@ io.on('connection', (socket) => {
       }).distinct('studentId')
       const respondedSet = new Set(respondedStudentIds.map(id => id.toString()))
 
-      for (const m of members) {
-        const sid = m.studentId.toString()
+      for (const studentId of participantIds) {
+        const sid = studentId.toString()
         if (respondedSet.has(sid)) continue  // already answered
 
         const { update } = await applyEvent(
-          m.studentId,
+          studentId,
           room._id,
           { type: 'skip', questionId },
           room.createdAt || new Date()
@@ -801,7 +803,6 @@ io.on('connection', (socket) => {
       }
     } catch (err) {
       console.error('Failed to persist currentQuestion on Room:', err.message)
->>>>>>> 12918fb (feat: wire risk score events into socket and question lifecycle)
     }
   })
 

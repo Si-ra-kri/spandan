@@ -43,7 +43,36 @@ router.get('/me', authenticate, async (req, res) => {
     return res.json({ success: true, entries: docs })
   } catch (error) {
     console.error('[risk-scores] /me error:', error)
-    return res.status(500).json({ error: 'Failed to fetch risk scores' })
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to fetch risk scores' })
+  }
+})
+
+// ─── Student: current live score in a specific room ─────────────────────────
+// GET /api/risk-scores/me/room/:roomId
+// Used by the widget on mount / page refresh to hydrate from persisted DB state.
+// Returns 100/safe defaults when no RiskScore doc exists yet (student hasn't
+// answered any question in this room).
+router.get('/me/room/:roomId', authenticate, async (req, res) => {
+  try {
+    const { roomId } = req.params
+    if (!mongoose.Types.ObjectId.isValid(roomId)) {
+      return res.status(400).json({ error: 'invalid roomId' })
+    }
+    const doc = await RiskScore.findOne({
+      studentId: req.user.id,
+      roomId
+    }).select('currentScore zone correctStreakNeeded lastUpdated').lean()
+
+    return res.json({
+      success: true,
+      currentScore:         doc?.currentScore        ?? 100,
+      zone:                 doc?.zone                ?? 'safe',
+      correctStreakNeeded:  doc?.correctStreakNeeded  ?? 0,
+      lastUpdated:          doc?.lastUpdated          ?? null
+    })
+  } catch (error) {
+    console.error('[risk-scores] /me/room error:', error)
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to fetch score' })
   }
 })
 
@@ -130,7 +159,7 @@ router.get('/student/:studentId/trend', authenticate, async (req, res) => {
     })
   } catch (error) {
     console.error('[risk-scores] /trend error:', error)
-    return res.status(500).json({ error: 'Failed to fetch trend' })
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to fetch trend' })
   }
 })
 
@@ -152,23 +181,24 @@ router.get('/room/:roomId', authenticate, async (req, res) => {
 
     const snapshot = await getRoomRiskSnapshot(roomId)
 
-    // Also include the roster (RoomMember list with user info) so the
-    // host's trend page can pick a student without a separate call.
-    const RoomMember = (await import('../models/RoomMember.js')).default
+    // Build roster from RiskScore docs — these persist even after students leave,
+    // so past rooms still show their full student list. RoomMember records are
+    // deleted on room:leave and would return an empty list for completed sessions.
     const User = (await import('../models/User.js')).default
-    const members = await RoomMember.find({ roomId: room._id })
-      .populate('studentId', 'name email')
+    const studentIds = await RiskScore.distinct('studentId', { roomId: room._id })
+    const users = await User.find({ _id: { $in: studentIds } })
+      .select('name email')
       .lean()
-    const roster = members.map(m => ({
-      _id: m.studentId?._id?.toString() || m.studentId?.toString(),
-      name: m.studentId?.name,
-      email: m.studentId?.email
-    })).filter(r => r._id)
+    const roster = users.map(u => ({
+      _id: u._id.toString(),
+      name: u.name,
+      email: u.email
+    }))
 
     return res.json({ success: true, snapshot, roster })
   } catch (error) {
     console.error('[risk-scores] /room error:', error)
-    return res.status(500).json({ error: 'Failed to fetch room snapshot' })
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to fetch room snapshot' })
   }
 })
 
