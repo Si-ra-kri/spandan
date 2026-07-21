@@ -679,4 +679,78 @@ router.get('/leaderboard/:roomId', async (req, res) => {
   }
 })
 
+// Teacher CSV export of a room's complete results — a gradebook matrix
+// (one row per student, one column per question). Reuses buildSnapshot (a single
+// aggregation pass = the exact data the results page renders), so it adds no new heavy
+// queries; a one-off download does not need the stampede cache. Rows are streamed.
+router.get('/room/:roomId/export', async (req, res) => {
+  try {
+    const Room = (await import('../models/Room.js')).default
+    const User = (await import('../models/User.js')).default
+    const { roomId } = req.params
+    const currentUser = req.user
+
+    const room = await Room.findById(roomId).lean()
+    if (!room) return res.status(404).json({ error: 'Room not found' })
+    if (room.teacher.toString() !== currentUser._id.toString()) {
+      return res.status(403).json({ error: 'Not authorized to export this room' })
+    }
+
+    const { leaderboard, byStudent, stats } = await resultsSnapshot.buildSnapshot(roomId)
+
+    // Question columns in chronological order (Q1 = first asked). Every byStudent array holds the
+    // same approved-question set in newest-first order, so take one and reverse.
+    const anySid = Object.keys(byStudent)[0]
+    const qCols = anySid ? [...byStudent[anySid]].reverse() : []
+    const statsByQid = new Map((stats.questionStats || []).map((q) => [q.questionId, q]))
+
+    // Emails for the participant set — one query.
+    const sids = leaderboard.map((e) => String(e.studentId))
+    const users = await User.find({ _id: { $in: sids } }).select('email').lean()
+    const emailById = new Map(users.map((u) => [u._id.toString(), u.email || '']))
+
+    const esc = (v) => {
+      const s = v == null ? '' : String(v)
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s
+    }
+    const row = (arr) => arr.map(esc).join(',') + '\n'
+
+    const safeName = (room.name || 'room').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 60)
+    const date = room.endedAt ? new Date(room.endedAt).toISOString().slice(0, 10) : 'session'
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="Spandan_${safeName}_${date}.csv"`)
+    res.write('\uFEFF') // UTF-8 BOM so Excel renders names, emails and the check marks correctly
+
+    const qHeaders = qCols.map((_, i) => `Q${i + 1}`)
+    res.write(row(['student', 'email', 'points', 'rank', 'correct', 'accuracy', ...qHeaders]))
+
+    for (const e of leaderboard) {
+      const byQid = new Map((byStudent[String(e.studentId)] || []).map((q) => [q._id, q]))
+      const acc = e.totalAnswered ? (e.correctCount / e.totalAnswered).toFixed(2) : ''
+      const cells = qCols.map((qc) => {
+        const q = byQid.get(qc._id)
+        return !q || !q.answered ? '' : (q.isCorrect ? '✓' : '✗')
+      })
+      res.write(row([
+        e.studentName || '', emailById.get(String(e.studentId)) || '',
+        e.totalPoints, e.rank, `${e.correctCount}/${e.totalAnswered}`, acc, ...cells
+      ]))
+    }
+
+    // Question legend so Q1..Qn are identifiable.
+    res.write('\n')
+    res.write(row(['Question', 'Text', 'Type', 'Responses', 'Correct %']))
+    qCols.forEach((qc, i) => {
+      const s = statsByQid.get(qc._id)
+      const pct = s && s.totalResponses ? Math.round((s.correctCount / s.totalResponses) * 100) + '%' : ''
+      res.write(row([`Q${i + 1}`, qc.question, qc.type, s ? s.totalResponses : '', pct]))
+    })
+    res.end()
+  } catch (error) {
+    console.error('CSV export error:', error)
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to export results' })
+    else res.end()
+  }
+})
+
 export default router
