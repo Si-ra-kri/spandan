@@ -357,6 +357,7 @@ app.get('/api/health', (req, res) => {
 
 // Socket.IO connection handling
 const connectedUsers = new Map() // socket.id -> userId
+app.set('connectedUsers', connectedUsers) // expose for route handlers (integrity events, risk scores)
 
 const SOCKET_JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production'
 

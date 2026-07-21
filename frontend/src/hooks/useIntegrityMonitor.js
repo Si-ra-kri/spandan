@@ -4,22 +4,23 @@
 // Three detectors run concurrently when `enabled` is true:
 //   1. Tab switch   — document visibilitychange (tab/window hidden)
 //   2. Window blur  — window blur (Alt+Tab or app switch even within same tab)
-//   3. Fullscreen   — requests fullscreen when activated, logs + re-requests on exit
+//   3. Fullscreen   — requests fullscreen on user click, logs + re-requests on exit
 //   4. Paste        — page-level paste event
+//
+// IMPORTANT: requestFullscreen() requires a user gesture (click/keypress).
+// The hook therefore returns { needsFullscreen, enterFullscreen } so the
+// parent can render a prompt overlay. When the student clicks it, enterFullscreen
+// is called — that click IS the user gesture the browser requires.
 //
 // Each detected event:
 //   a. POSTs to /api/integrity-events (fire-and-forget, never blocks UI)
 //   b. Shows a brief warning toast to the student
-//
-// All listeners are removed on unmount or when `enabled` flips to false.
 
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useState } from 'react'
 import { API_URL } from '../config.js'
 
 // ── Toast helper ──────────────────────────────────────────────────────────────
-// Injects a self-removing toast into the DOM without needing a toast library.
 function showWarningToast(message) {
-  // Remove any existing integrity toast first (avoid stacking).
   document.getElementById('integrity-toast')?.remove()
 
   const toast = document.createElement('div')
@@ -43,7 +44,6 @@ function showWarningToast(message) {
     animation: integritySlideDown 0.3s ease;
   `
 
-  // Inject keyframes once.
   if (!document.getElementById('integrity-keyframes')) {
     const style = document.createElement('style')
     style.id = 'integrity-keyframes'
@@ -56,21 +56,18 @@ function showWarningToast(message) {
     document.head.appendChild(style)
   }
 
-  toast.textContent = `⚠️ ${message}`
+  toast.textContent = `\u26a0\ufe0f ${message}`
   document.body.appendChild(toast)
   setTimeout(() => toast.remove(), 4000)
 }
 
 // ── Main hook ─────────────────────────────────────────────────────────────────
 export function useIntegrityMonitor({ roomId, questionId, token, enabled }) {
-  // Keep a ref so the async POST closure always sees the latest questionId
-  // without needing to re-register listeners on every question change.
   const questionIdRef = useRef(questionId)
   useEffect(() => { questionIdRef.current = questionId }, [questionId])
 
-  // Track whether we currently hold fullscreen so we don't re-request
-  // unnecessarily on every render.
-  const fullscreenActiveRef = useRef(false)
+  // Whether the fullscreen prompt overlay should be shown to the student.
+  const [needsFullscreen, setNeedsFullscreen] = useState(false)
 
   // ── POST helper ─────────────────────────────────────────────────────────────
   const logEvent = useCallback(async (eventType, metadata = {}) => {
@@ -90,98 +87,97 @@ export function useIntegrityMonitor({ roomId, questionId, token, enabled }) {
         })
       })
     } catch {
-      // Network errors are silently swallowed — integrity logging must never
-      // crash or block the student's quiz experience.
+      // Never crash the quiz on a network error.
     }
   }, [roomId, token])
 
-  // ── Fullscreen helpers ───────────────────────────────────────────────────────
-  const requestFullscreen = useCallback(() => {
+  // ── enterFullscreen — MUST be called from a click handler ────────────────
+  // Browser security requires requestFullscreen() to originate from a user
+  // gesture. We expose this so the parent renders a button; clicking that
+  // button is the required gesture.
+  const enterFullscreen = useCallback(() => {
     const el = document.documentElement
-    if (!el.requestFullscreen) return   // API not available (some mobile browsers)
-    if (document.fullscreenElement) return  // already fullscreen
-    el.requestFullscreen().catch(() => {
-      // requestFullscreen must be called from a user gesture; if it fails
-      // (e.g. first call before any click), just skip silently.
-    })
+    if (!el.requestFullscreen) {
+      // API not supported (some mobile browsers) — just dismiss the prompt.
+      setNeedsFullscreen(false)
+      return
+    }
+    el.requestFullscreen()
+      .then(() => setNeedsFullscreen(false))
+      .catch(() => setNeedsFullscreen(false))
   }, [])
 
-  // ── Effect: register / unregister all listeners ─────────────────────────────
+  // ── Effect: register / unregister all listeners ──────────────────────────
   useEffect(() => {
-    if (!enabled || !roomId || !token) return
+    if (!enabled || !roomId || !token) {
+      setNeedsFullscreen(false)
+      return
+    }
 
-    // 1. Request fullscreen immediately when a question goes active.
-    requestFullscreen()
-    fullscreenActiveRef.current = !!document.fullscreenElement
+    // Show the fullscreen prompt when a question goes live.
+    // Actual entry happens when the student clicks the prompt button.
+    if (!document.fullscreenElement) {
+      setNeedsFullscreen(true)
+    }
 
-    // ── Handler: tab switch (visibilitychange) ─────────────────────────────
+    // ── Handler: tab switch ──────────────────────────────────────────────
     function handleVisibility() {
       if (document.visibilityState === 'hidden') {
         logEvent('tab_switch', { visibilityState: 'hidden' })
-        showWarningToast('You left the quiz tab — this has been recorded by your teacher.')
+        showWarningToast('You left the quiz tab \u2014 this has been recorded by your teacher.')
       }
     }
 
-    // ── Handler: window blur (Alt+Tab / app switch) ────────────────────────
-    // Fires when the browser window loses focus even when the tab stays active.
-    // Debounced: blur often fires before visibilitychange on the same action,
-    // so we only log a window_blur if no visibilitychange follows within 150ms.
+    // ── Handler: window blur (debounced 150ms) ───────────────────────────
+    // blur fires before visibilitychange on the same action, so we wait
+    // 150ms and only log window_blur if the tab is still visible.
     let blurDebounce = null
     function handleBlur() {
       blurDebounce = setTimeout(() => {
-        // If the tab is already hidden, visibilitychange already covered it.
         if (document.visibilityState === 'visible') {
           logEvent('window_blur', {})
-          showWarningToast('You left the quiz window — this has been recorded by your teacher.')
+          showWarningToast('You left the quiz window \u2014 this has been recorded by your teacher.')
         }
       }, 150)
     }
-    function handleFocus() {
-      clearTimeout(blurDebounce)
-    }
+    function handleFocus() { clearTimeout(blurDebounce) }
 
-    // ── Handler: fullscreen exit ───────────────────────────────────────────
+    // ── Handler: fullscreen exit ─────────────────────────────────────────
     function handleFullscreenChange() {
-      const isNowFullscreen = !!document.fullscreenElement
-      if (fullscreenActiveRef.current && !isNowFullscreen) {
-        // Student exited fullscreen.
+      if (!document.fullscreenElement) {
         logEvent('fullscreen_exit', {})
-        showWarningToast('You exited fullscreen — this has been recorded. Returning to fullscreen...')
-        // Re-request after a brief delay so the toast is visible first.
-        setTimeout(requestFullscreen, 1200)
+        showWarningToast('You exited fullscreen \u2014 this has been recorded. Please return to fullscreen.')
+        setNeedsFullscreen(true)
       }
-      fullscreenActiveRef.current = isNowFullscreen
     }
 
-    // ── Handler: paste ─────────────────────────────────────────────────────
+    // ── Handler: paste ───────────────────────────────────────────────────
     function handlePaste(e) {
-      const pastedText   = e.clipboardData?.getData('text') || ''
-      const pastedLength = pastedText.length
+      const pastedLength = (e.clipboardData?.getData('text') || '').length
       logEvent('paste', { pastedLength })
-      showWarningToast('Paste detected — this has been recorded by your teacher.')
+      showWarningToast('Paste detected \u2014 this has been recorded by your teacher.')
     }
 
-    // Register all listeners.
-    document.addEventListener('visibilitychange',  handleVisibility)
-    window.addEventListener('blur',                handleBlur)
-    window.addEventListener('focus',               handleFocus)
-    document.addEventListener('fullscreenchange',  handleFullscreenChange)
-    document.addEventListener('paste',             handlePaste)
+    document.addEventListener('visibilitychange', handleVisibility)
+    window.addEventListener('blur',               handleBlur)
+    window.addEventListener('focus',              handleFocus)
+    document.addEventListener('fullscreenchange', handleFullscreenChange)
+    document.addEventListener('paste',            handlePaste)
 
     return () => {
-      // Clean up on unmount or when enabled becomes false (question ended).
       document.removeEventListener('visibilitychange', handleVisibility)
       window.removeEventListener('blur',               handleBlur)
       window.removeEventListener('focus',              handleFocus)
       document.removeEventListener('fullscreenchange', handleFullscreenChange)
       document.removeEventListener('paste',            handlePaste)
       clearTimeout(blurDebounce)
-
-      // Exit fullscreen when the question ends so the teacher's page is
-      // not stuck in fullscreen mode after the quiz.
+      setNeedsFullscreen(false)
+      // Exit fullscreen when question ends so the page doesn't stay fullscreen.
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {})
       }
     }
-  }, [enabled, roomId, token, logEvent, requestFullscreen])
+  }, [enabled, roomId, token, logEvent])
+
+  return { needsFullscreen, enterFullscreen }
 }
