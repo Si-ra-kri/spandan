@@ -13,12 +13,13 @@ import { initRedis } from './config/redis.js'
 import { computeRanked } from './services/leaderboardAgg.js'
 
 // Import routes
-import authRoutes from './routes/auth.js'
-import roomRoutes from './routes/rooms.js'
-import questionRoutes from './routes/questions.js'
+import authRoutes         from './routes/auth.js'
+import roomRoutes         from './routes/rooms.js'
+import questionRoutes     from './routes/questions.js'
 import transcriptionRoutes from './routes/transcription.js'
-import transcriptRoutes from './routes/transcripts.js'
-import responseRoutes from './routes/responses.js'
+import transcriptRoutes   from './routes/transcripts.js'
+import responseRoutes     from './routes/responses.js'
+import integrityRoutes    from './routes/integrityEvents.js'
 
 // Import models for reference
 import './models/index.js'
@@ -336,12 +337,13 @@ app.use('/api/responses/leaderboard/', leaderboardLimiter)  // leaderboard route
 app.use(requestTimeout)
 
 // API Routes
-app.use('/api/auth', authRoutes)
-app.use('/api/rooms', roomRoutes)
-app.use('/api/questions', questionRoutes)
-app.use('/api/transcription', transcriptionRoutes)
-app.use('/api/transcripts', transcriptRoutes)
-app.use('/api/responses', responseRoutes)
+app.use('/api/auth',               authRoutes)
+app.use('/api/rooms',              roomRoutes)
+app.use('/api/questions',          questionRoutes)
+app.use('/api/transcription',      transcriptionRoutes)
+app.use('/api/transcripts',        transcriptRoutes)
+app.use('/api/responses',          responseRoutes)
+app.use('/api/integrity-events',   integrityRoutes)
 
 // Health check
 app.get('/api/health', (req, res) => {

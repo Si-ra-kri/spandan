@@ -8,6 +8,7 @@ import ThemeToggle from '../components/ThemeToggle'
 import ProfileDropdown from '../components/ProfileDropdown'
 import Leaderboard from '../components/Leaderboard'
 import useIsMobile from '../hooks/useIsMobile'
+import { useIntegrityMonitor } from '../hooks/useIntegrityMonitor'
 import { API_URL } from '../config.js'
 
 // Spread the ~N students' navigation to the results page over this window (ms). When a big room
@@ -39,6 +40,18 @@ function StudentRoomPage() {
   const [sessionEnded, setSessionEnded] = useState(false) // room ended → show interstitial while we stagger navigation
   const timerIntervalRef = useRef(null)
   const resultsNavTimerRef = useRef(null)
+
+  // ── Integrity monitoring ────────────────────────────────────────────────
+  // Active only while a question is live. Logs tab switches, window blurs,
+  // fullscreen exits, and paste events to /api/integrity-events and emits
+  // a real-time socket alert to the teacher.
+  useIntegrityMonitor({
+    roomId:     room?._id,
+    questionId: currentQuestion?._id ?? currentQuestion?.question?._id ?? null,
+    token,
+    enabled:    !!currentQuestion && !submitted
+  })
+  // ────────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!token || !socket) return
