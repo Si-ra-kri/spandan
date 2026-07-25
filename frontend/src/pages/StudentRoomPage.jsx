@@ -683,13 +683,13 @@ function StudentRoomPage() {
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                             <span style={{
                               padding: '2px 10px',
-                              background: q.answered ? '#d1fae5' : '#fee2e2',
-                              color: q.answered ? '#059669' : '#dc2626',
+                              background: q.answered ? '#d1fae5' : (q.resultPending ? '#eff6ff' : '#fee2e2'),
+                              color: q.answered ? '#059669' : (q.resultPending ? '#3b82f6' : '#dc2626'),
                               borderRadius: '6px',
                               fontSize: '12px',
                               fontWeight: '600'
                             }}>
-                              {q.answered ? 'Answered' : 'Missed'}
+                              {q.answered ? 'Answered' : (q.resultPending ? 'Live' : 'Missed')}
                             </span>
                             <span style={{
                               padding: '2px 10px',
@@ -709,10 +709,23 @@ function StudentRoomPage() {
                               fontSize: '12px',
                               fontWeight: '600'
                             }}>
-                              {q.answered ? (q.pointsEarned || 0) : 0}/{q.maxPoints || 100} pts
+                              {q.resultPending ? '—' : (q.answered ? (q.pointsEarned || 0) : 0)}/{q.maxPoints || 100} pts
                             </span>
                           </div>
-                          {q.answered && q.isCorrect && (
+                          {/* Live poll: result withheld until the poll closes — show a neutral badge, never correct/incorrect. */}
+                          {q.resultPending && q.answered && (
+                            <span style={{
+                              padding: '4px 12px',
+                              background: '#3b82f6',
+                              color: 'white',
+                              borderRadius: '6px',
+                              fontSize: '12px',
+                              fontWeight: '600'
+                            }}>
+                              ⏳ Answer submitted
+                            </span>
+                          )}
+                          {!q.resultPending && q.answered && q.isCorrect && (
                             <span style={{
                               padding: '4px 12px',
                               background: '#10b981',
@@ -724,7 +737,7 @@ function StudentRoomPage() {
                               ✓ Correct (+{q.pointsEarned || 0})
                             </span>
                           )}
-                          {q.answered && !q.isCorrect && (
+                          {!q.resultPending && q.answered && !q.isCorrect && (
                             <span style={{
                               padding: '4px 12px',
                               background: '#ef4444',
@@ -746,27 +759,49 @@ function StudentRoomPage() {
                         {/* All options - always shown */}
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
                           {(q.options || []).map((option, optIdx) => {
+                            const pending = !!q.resultPending
                             const isSelected = q.selectedOptions?.includes(optIdx)
                             const isCorrect = option.isCorrect
                             const letter = String.fromCharCode(65 + optIdx)
-                            
+
                             let bgColor = 'var(--bg-secondary)'
                             let borderColor = 'var(--border-color)'
                             let textColor = 'var(--text-primary)'
+                            let letterBg = 'var(--border-color)'
                             let label = ''
-                            
-                            if (q.answered && isSelected && isCorrect) {
+
+                            if (pending) {
+                              // Live poll: NEVER reveal the correct option. Only mark what the student
+                              // picked, in blue — the correct/incorrect result comes after it closes.
+                              if (q.answered && isSelected) {
+                                bgColor = '#eff6ff'
+                                borderColor = '#3b82f6'
+                                letterBg = '#3b82f6'
+                                // The highlight bg is a fixed light pastel, so text must be a dark
+                                // accent (not var(--text-primary), which is white in dark mode and
+                                // would wash out over the pastel). Mirrors the teacher side.
+                                textColor = '#1e40af'
+                                label = ' (Your answer)'
+                              }
+                            } else if (q.answered && isSelected && isCorrect) {
                               bgColor = '#d1fae5'
                               borderColor = '#059669'
+                              letterBg = '#059669'
+                              textColor = '#065f46'
                               label = ' (Your correct answer)'
                             } else if (q.answered && isSelected && !isCorrect) {
                               bgColor = '#fee2e2'
                               borderColor = '#dc2626'
+                              textColor = '#991b1b'
                               label = ' (Your wrong answer)'
                             } else if (!q.answered && isCorrect) {
                               bgColor = '#d1fae5'
                               borderColor = '#059669'
+                              letterBg = '#059669'
+                              textColor = '#065f46'
                               label = ' (Correct answer)'
+                            } else if (isCorrect) {
+                              letterBg = '#059669'
                             }
                             
                             return (
@@ -783,7 +818,7 @@ function StudentRoomPage() {
                                   width: '28px',
                                   height: '28px',
                                   borderRadius: '50%',
-                                  background: isCorrect ? '#059669' : 'var(--border-color)',
+                                  background: letterBg,
                                   color: 'white',
                                   display: 'flex',
                                   alignItems: 'center',
@@ -807,8 +842,13 @@ function StudentRoomPage() {
                           })}
                         </div>
                         
-                        {/* Missed question notice */}
-                        {!q.answered && (
+                        {/* Live poll: result withheld until it closes. Otherwise, missed-question notice. */}
+                        {q.resultPending && (
+                          <p style={{ fontSize: '13px', color: '#3b82f6', margin: 0, fontStyle: 'italic' }}>
+                            ⏳ Result will be shown once this poll closes
+                          </p>
+                        )}
+                        {!q.resultPending && !q.answered && (
                           <p style={{ fontSize: '13px', color: '#dc2626', margin: 0, fontStyle: 'italic' }}>
                             ⚠️ You did not answer this question
                           </p>

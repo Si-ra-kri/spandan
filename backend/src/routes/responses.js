@@ -2,6 +2,7 @@ import express from 'express'
 import { authenticate, authorize } from '../middleware/auth.js'
 import { isBatchEnabled, bufferResponse } from '../services/responseBuffer.js'
 import * as resultsSnapshot from '../services/resultsSnapshot.js'
+import { debug } from '../utils/debug.js'
 const router = express.Router()
 
 // Apply authentication to all routes
@@ -48,6 +49,43 @@ async function getQuestionCached(Question, questionId) {
   }
   return q
 }
+
+// The GET /responses/room/:id/student/:id read path fetches the room's FULL approved-question list.
+// That list is student-INDEPENDENT (identical for everyone in the room), yet every student hits the
+// endpoint when their poll timer expires — at classroom scale that is hundreds of identical
+// Question.find + serializations per poll transition. Cache the list per room so the herd collapses
+// to ~one query per TTL per instance. The per-student response merge in the handler stays fresh (it
+// comes from a separate Response.find); the cached array is only ever read, never mutated. Staleness
+// is bounded by the TTL and benign: a question is approved at launch (~a poll-length before its poll
+// ends), so it is always in the cache by the time students read; the live question arrives via the
+// new_question socket, not this endpoint.
+const ROOM_QUESTIONS_TTL_MS = Number(process.env.ROOM_QUESTIONS_CACHE_TTL_MS) || 10000
+const roomQuestionsCache = new Map()    // roomId(str) -> { questions, expiresAt(ms) }
+const roomQuestionsInflight = new Map() // roomId(str) -> Promise<questions>  (single-flight)
+
+async function getRoomQuestionsCached(Question, roomObjectId) {
+  const key = String(roomObjectId)
+  const hit = roomQuestionsCache.get(key)
+  if (hit && hit.expiresAt > Date.now()) return hit.questions
+  // Single-flight: if a query for this room is already running, share it instead of firing another.
+  // This matters most at a congested transition where the whole room misses at once and the first
+  // query is slow — without this, everyone who arrives before it returns would each hit Mongo.
+  const inflight = roomQuestionsInflight.get(key)
+  if (inflight) return inflight
+  const p = (async () => {
+    try {
+      const questions = await Question.find({ roomId: roomObjectId, status: 'approved' })
+        .sort({ createdAt: -1 }).lean()
+      if (roomQuestionsCache.size > 50000) roomQuestionsCache.clear()
+      roomQuestionsCache.set(key, { questions, expiresAt: Date.now() + ROOM_QUESTIONS_TTL_MS })
+      return questions
+    } finally {
+      roomQuestionsInflight.delete(key)
+    }
+  })()
+  roomQuestionsInflight.set(key, p)
+  return p
+}
 // ----------------------------------------------------------------------------------------------
 
 // POST /api/responses - Save a student's answer
@@ -75,6 +113,28 @@ router.post('/', authorize('student'), async (req, res) => {
     const question = await getQuestionCached(Question, questionId)
     if (!question) {
       return res.status(404).json({ error: 'Question not found' })
+    }
+
+    // Phase 3 — response-window enforcement. A poll is answerable only while it is the room's LIVE
+    // poll (room.currentQuestion), or briefly after it is superseded (until its closeAt = next-launch
+    // time + POLL_RESPONSE_GRACE_MS, which covers in-flight/late submits — see setLiveQuestion). Any
+    // other case — an old poll a bot tries to back-fill, a never-launched question, or ANY poll once
+    // the room has ended — is refused. This does not weaken the live poll (still answerable) and
+    // reveals nothing; it only closes the back-fill hole. Room is read fresh (the live pointer must
+    // not be stale); closeAt is read fresh only on the rare non-current path (the cached question copy
+    // can lag the stamp written on launch), so the hot path stays a single small room read.
+    const Room = (await import('../models/Room.js')).default
+    const { getRoomLive } = await import('../services/roomLiveCache.js')
+    const roomLive = await getRoomLive(Room, roomId) // Redis hit → no Mongo read; miss/Redis-off → Mongo
+    if (!roomLive || roomLive.endedAt) {
+      return res.status(409).json({ error: 'poll_closed' })
+    }
+    if (String(questionId) !== String(roomLive.currentQuestion || '')) {
+      const fresh = await Question.findById(questionId).select('closeAt')
+      const closeAt = fresh?.closeAt ? new Date(fresh.closeAt).getTime() : 0
+      if (!closeAt || Date.now() >= closeAt) {
+        return res.status(409).json({ error: 'poll_closed' })
+      }
     }
 
     // Check if answer is correct based on question type
@@ -148,9 +208,8 @@ router.post('/', authorize('student'), async (req, res) => {
             error: 'Already responded to this question',
             existingResponse: existingResponse ? {
               selectedOption: existingResponse.selectedOption,
-              selectedOptions: existingResponse.selectedOptions,
-              isCorrect: existingResponse.isCorrect,
-              points: existingResponse.points
+              selectedOptions: existingResponse.selectedOptions
+              // isCorrect + points withheld — same reason as the success response above.
             } : undefined
           })
         }
@@ -168,13 +227,15 @@ router.post('/', authorize('student'), async (req, res) => {
     live?.scheduleLeaderboard(roomId)
     const rankInfo = (live ? await live.getRank(roomId, studentId) : null) || {}
 
+    // Withhold the answerer's OWN correctness (isCorrect + points) from the immediate response while
+    // the session is live — otherwise a student (or a dummy / second account) learns the answer the
+    // instant they submit, straight from the Network tab, and can relay it. The answer is still
+    // SCORED and saved server-side; the student sees their result via the results path once polls are
+    // no longer live. The client only uses `rank` from this response, so nothing it renders changes.
+    const { isCorrect: _omitIsCorrect, points: _omitPoints, ...safeResponse } = savedResponse
     res.status(201).json({
       success: true,
-      response: {
-        ...savedResponse,
-        isCorrect,
-        points
-      },
+      response: safeResponse,
       rank: rankInfo.rank ?? null,
       totalParticipants: rankInfo.totalParticipants ?? null
     })
@@ -281,7 +342,11 @@ router.get('/stats/student/:studentId', async (req, res) => {
     const roomIdsMember = roomMemberships.map(m => m.roomId)
     const uniqueRoomIdsFromResponse = await Response.distinct('roomId', { studentId })
     const allRoomIds = [...new Set([...roomIdsMember.map(id => id.toString()), ...uniqueRoomIdsFromResponse.map(id => id.toString())])]
-    const totalRooms = allRoomIds.length
+    // Count only rooms that still exist. A deleted room leaves orphaned membership/response
+    // records whose roomId would otherwise inflate totalRooms (and the launched-poll count below),
+    // making the dashboard "Total Rooms" disagree with the existence-checked Room History list.
+    const existingRoomIds = (await Room.distinct('_id', { _id: { $in: allRoomIds } })).map(id => id.toString())
+    const totalRooms = existingRoomIds.length
     const roomIds = roomMemberships.map(m => m.roomId)
     
     // Total responses (polls taken)
@@ -293,9 +358,9 @@ router.get('/stats/student/:studentId', async (req, res) => {
     const average = pollsTaken > 0 ? Math.round((totalPoints / (pollsTaken * 100)) * 100) : 0
 
     // Count launched polls: questions with 'approved' status (approved & launched to students)
-    // Use allRoomIds (RoomMember + Response unique) to count ALL rooms student participated in
+    // Use existingRoomIds (rooms that still exist) to count polls across the student's rooms.
     const launchedCount = await Question.countDocuments({
-      roomId: { $in: allRoomIds },
+      roomId: { $in: existingRoomIds },
       status: 'approved'
     })
     const pollsMissed = Math.max(0, launchedCount - pollsTaken)
@@ -473,7 +538,7 @@ router.get('/room/:roomId/student/:studentId', async (req, res) => {
     }).lean()
     
     // Debug log
-    console.log(`[responses] Fetched ${responses.length} responses for student ${studentId} in room ${roomId}`)
+    debug(`[responses] Fetched ${responses.length} responses for student ${studentId} in room ${roomId}`)
     
     // Create a map of questionId -> response for quick lookup
     // Use a helper to safely convert any ID to string
@@ -488,42 +553,58 @@ router.get('/room/:roomId/student/:studentId', async (req, res) => {
     const responseMap = {}
     responses.forEach(r => {
       const qId = toIdString(r.questionId)
-      console.log(`[responses] Response for questionId: ${qId}, selectedOption: ${r.selectedOption}, isCorrect: ${r.isCorrect}`)
+      debug(`[responses] Response for questionId: ${qId}, selectedOption: ${r.selectedOption}, isCorrect: ${r.isCorrect}`)
       responseMap[qId] = r
     })
 
-    // Get all approved questions for this room (launched to students)
-    const questions = await Question.find({ 
-      roomId: roomObjectId, 
-      status: 'approved'
-    }).sort({ createdAt: -1 }).lean()  // Sort by newest first (latest asked question on top)
+    // Get all approved questions for this room (launched to students). Cached per-room (short TTL)
+    // because this list is identical for every student and the whole room hits this endpoint at once
+    // when a poll ends — see getRoomQuestionsCached. Sorted newest-first (latest asked on top).
+    const questions = await getRoomQuestionsCached(Question, roomObjectId)
 
-    console.log(`[responses] Found ${questions.length} questions for room ${roomId}`)
+    debug(`[responses] Found ${questions.length} questions for room ${roomId}`)
+
+    // While the room is LIVE, the currently-active poll (room.currentQuestion) must not reveal its
+    // correct answer to ANYONE — not even a student who already answered (else a dummy / second
+    // account could answer randomly, read isCorrect/points, and relay it). We still return the
+    // question with the student's marked answer (the frontend renders it neutrally), but strip which
+    // option is correct and withhold the student's own isCorrect + pointsEarned until the poll is no
+    // longer current (next launch / room end → revealed via the normal path / results snapshot).
+    const activeQid = (!ended && room?.currentQuestion) ? String(room.currentQuestion) : null
 
     // Merge questions with response data
     const questionsWithResponses = questions.map(q => {
       const qIdStr = toIdString(q._id)
       const studentResponse = responseMap[qIdStr]
+      const isActive = !!activeQid && qIdStr === activeQid
+      // Strip which option is correct for the still-live poll. Map to NEW objects — the question list
+      // is a shared cache and must never be mutated (see the cache's read-only invariant).
+      const options = isActive
+        ? q.options.map(o => (o && typeof o === 'object') ? (({ isCorrect, ...opt }) => opt)(o) : o)
+        : q.options
       
       if (studentResponse) {
-        console.log(`[responses] Matched question ${qIdStr} with response, selectedOption: ${studentResponse.selectedOption}`)
+        debug(`[responses] Matched question ${qIdStr} with response, selectedOption: ${studentResponse.selectedOption}`)
       }
       
       return {
         _id: qIdStr,
         question: q.question,
         type: q.type,
-        options: q.options,
+        options,
         segmentIndex: q.segmentIndex,
         maxPoints: q.points,
         timeToAnswer: q.timeToAnswer,
         answered: !!studentResponse,
+        // Tells the frontend to render this still-live question neutrally: marked answer in blue, or
+        // a "missed" tag if unanswered — no correct/incorrect until it is revealed.
+        ...(isActive ? { resultPending: true } : {}),
         ...(studentResponse && {
           selectedOption: studentResponse.selectedOption,
           selectedOptions: studentResponse.selectedOptions || [studentResponse.selectedOption],
-          isCorrect: studentResponse.isCorrect,
           responseTime: studentResponse.responseTime,
-          pointsEarned: studentResponse.points
+          // isCorrect + pointsEarned both reveal correctness → withhold for the live poll, send once past.
+          ...(isActive ? {} : { isCorrect: studentResponse.isCorrect, pointsEarned: studentResponse.points })
         }),
         createdAt: q.createdAt
       }
