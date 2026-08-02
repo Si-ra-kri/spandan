@@ -9,11 +9,13 @@ const menuItems = {
     { id: 'manage-room', label: 'Manage Room', icon: '⚙️', path: '/teacher/manage-room' },
     { id: 'room-history', label: 'Room History', icon: '📜', path: '/teacher/room-history' },
     { id: 'join-as-guest', label: 'Join as Co-host', icon: '🎫', path: '/teacher/join-as-guest' },
+    { id: 'manual', label: 'Manual', icon: 'ℹ️', path: '/teacher/help' },
   ],
   student: [
     { id: 'dashboard', label: 'Dashboard', icon: '📊', path: '/student' },
     { id: 'join-room', label: 'Join Room', icon: '🔗', path: '/student/join-room' },
     { id: 'room-history', label: 'Room History', icon: '📜', path: '/student/room-history' },
+    { id: 'manual', label: 'Manual', icon: 'ℹ️', path: '/student/help' },
   ]
 }
 

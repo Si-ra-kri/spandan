@@ -16,7 +16,8 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'roomId, segmentIndex, and text are required' })
     }
 
-    // Only the room owner can save transcripts; co-hosts are not allowed
+    // Authorization: only the room's OWNING teacher may write a transcript for it.
+    // Co-hosts are not allowed to save transcripts.
     const room = await Room.findById(roomId)
     if (!room) return res.status(404).json({ error: 'Room not found' })
     const ownerId = room.teacher?._id ? room.teacher._id.toString() : room.teacher.toString()

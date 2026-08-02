@@ -17,6 +17,7 @@ import RoomHistoryPage from './pages/RoomHistoryPage'
 import RoomResultsPage from './pages/RoomResultsPage'
 import ProfilePage from './pages/ProfilePage'
 import JoinAsGuestPage from './pages/JoinAsGuestPage'
+import HelpPage from './pages/HelpPage'
 import { API_URL } from './config.js'
 import { isTokenExpired } from './lib/jwt.js'
 
@@ -73,16 +74,13 @@ function App() {
           return
         }
 
-        // Send to Spandan backend for auto-provisioning
+        // Send the Samagama token to the Spandan backend, which re-verifies it
+        // server-side and provisions the account from the identity Samagama returns.
+        // We deliberately do not send email/name/admin flags — the server does not trust them.
         const spandanResponse = await fetch(`${API_URL}/auth/samagama-auto-login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: samagamaUser.email,
-            name: samagamaUser.name,
-            isAdmin: samagamaUser.isAdmin || false,
-            isSuperAdmin: samagamaUser.isSuperAdmin || false
-          })
+          body: JSON.stringify({ samagamaToken })
         })
 
         if (!spandanResponse.ok) {
@@ -179,6 +177,11 @@ function App() {
             <RoomResultsPage />
           </ProtectedRoute>
         } />
+        <Route path="/teacher/help" element={
+          <ProtectedRoute allowedRoles={['teacher']}>
+            <HelpPage />
+          </ProtectedRoute>
+        } />
         <Route path="/student" element={
           <ProtectedRoute allowedRoles={['student']}>
             <StudentDashboard />
@@ -187,6 +190,11 @@ function App() {
         <Route path="/student/join-room" element={
           <ProtectedRoute allowedRoles={['student']}>
             <JoinRoomPage />
+          </ProtectedRoute>
+        } />
+        <Route path="/student/help" element={
+          <ProtectedRoute allowedRoles={['student']}>
+            <HelpPage />
           </ProtectedRoute>
         } />
         <Route path="/student/room-history" element={
