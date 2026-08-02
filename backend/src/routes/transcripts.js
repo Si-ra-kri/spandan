@@ -3,16 +3,25 @@ import Transcript from '../models/Transcript.js'
 import Room from '../models/Room.js'
 import RoomMember from '../models/RoomMember.js'
 import { authenticate } from '../middleware/auth.js'
+import { isRoomHost } from '../services/roomService.js'
 
 const router = express.Router()
 
-// Create a new transcript entry
+// Create a new transcript entry — room owner only (co-hosts may not alter transcripts)
 router.post('/', authenticate, async (req, res) => {
   try {
     const { roomId, segmentIndex, text, duration, wordCount, source } = req.body
 
     if (!roomId || segmentIndex === undefined || !text) {
       return res.status(400).json({ error: 'roomId, segmentIndex, and text are required' })
+    }
+
+    // Only the room owner can save transcripts; co-hosts are not allowed
+    const room = await Room.findById(roomId)
+    if (!room) return res.status(404).json({ error: 'Room not found' })
+    const ownerId = room.teacher?._id ? room.teacher._id.toString() : room.teacher.toString()
+    if (ownerId !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Only the room owner can save transcripts' })
     }
 
     const transcript = new Transcript({
@@ -49,8 +58,8 @@ router.get('/room/:roomId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Room not found' })
     }
 
-    // Check access: teacher owns room OR student is a member
-    const isTeacher = room.teacher.toString() === currentUser._id.toString()
+    // Check access: room host (owner or co-host) OR student member
+    const isTeacher = isRoomHost(room, currentUser._id)
     const isStudentMember = await RoomMember.findOne({ roomId, studentId: currentUser._id })
 
     if (!isTeacher && !isStudentMember) {
@@ -83,8 +92,8 @@ router.get('/:roomId/:segmentIndex', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Room not found' })
     }
 
-    // Check access: teacher owns room OR student is a member
-    const isTeacher = room.teacher.toString() === currentUser._id.toString()
+    // Check access: room host (owner or co-host) OR student member
+    const isTeacher = isRoomHost(room, currentUser._id)
     const isStudentMember = await RoomMember.findOne({ roomId, studentId: currentUser._id })
 
     if (!isTeacher && !isStudentMember) {

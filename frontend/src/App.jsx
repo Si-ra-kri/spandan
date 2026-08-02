@@ -16,6 +16,7 @@ import JoinRoomPage from './pages/JoinRoomPage'
 import RoomHistoryPage from './pages/RoomHistoryPage'
 import RoomResultsPage from './pages/RoomResultsPage'
 import ProfilePage from './pages/ProfilePage'
+import JoinAsGuestPage from './pages/JoinAsGuestPage'
 import { API_URL } from './config.js'
 import { isTokenExpired } from './lib/jwt.js'
 
@@ -166,6 +167,11 @@ function App() {
         <Route path="/teacher/room/:roomId" element={
           <ProtectedRoute allowedRoles={['teacher']}>
             <RoomDetailPage />
+          </ProtectedRoute>
+        } />
+        <Route path="/teacher/join-as-guest" element={
+          <ProtectedRoute allowedRoles={['teacher']}>
+            <JoinAsGuestPage />
           </ProtectedRoute>
         } />
         <Route path="/teacher/room/:roomId/results" element={
