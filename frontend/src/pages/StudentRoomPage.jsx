@@ -7,6 +7,8 @@ import Sidebar from '../components/Sidebar'
 import ThemeToggle from '../components/ThemeToggle'
 import ProfileDropdown from '../components/ProfileDropdown'
 import Leaderboard from '../components/Leaderboard'
+import ErrorBoundary from '../components/ErrorBoundary'
+import YouTubeVideo, { extractYouTubeId } from '../components/YouTubeVideo'
 import useIsMobile from '../hooks/useIsMobile'
 import { useIntegrityMonitor } from '../hooks/useIntegrityMonitor'
 import { API_URL } from '../config.js'
@@ -32,7 +34,6 @@ function StudentRoomPage() {
   const [selectedOptions, setSelectedOptions] = useState([]) // Array for MSQ support
   const [submitted, setSubmitted] = useState(false)
   const [hasAnsweredPoll, setHasAnsweredPoll] = useState(false) // Track if student has answered at least one poll
-  const [myRank, setMyRank] = useState(null) // this student's latest rank, returned by the submit POST
   const [timeLeft, setTimeLeft] = useState(0)
   const [results, setResults] = useState(null)
   // Past responses loaded from MongoDB - no sessionStorage needed
@@ -40,6 +41,7 @@ function StudentRoomPage() {
   const [sessionEnded, setSessionEnded] = useState(false) // room ended → show interstitial while we stagger navigation
   const timerIntervalRef = useRef(null)
   const resultsNavTimerRef = useRef(null)
+
 
   // ── Integrity monitoring ────────────────────────────────────────────────
   // Active only while a question is live. Logs tab switches, window blurs,
@@ -54,6 +56,41 @@ function StudentRoomPage() {
     enabled:    !!currentQuestion   // active for full question duration, even after submitting
   })
   // ────────────────────────────────────────────────────────────────────────
+
+  // Video mode: students watch independently (pause + rewind allowed, no forward-seek), and the
+  // player pauses locally while a question is live.
+  const isVideoMode = room?.settings?.mode === 'video'
+  const videoId = isVideoMode ? extractYouTubeId(room?.settings?.videoUrl) : null
+  const studentPlayerRef = useRef(null)
+  const teacherVideoTimeRef = useRef(null) // { time, playing, at } — teacher position for the forward-seek ceiling
+  const capSuppressUntilRef = useRef(0) // performance.now() until which the forward cap is suspended (post-poll live-edge resume)
+  const [isLiveStream, setIsLiveStream] = useState(false)
+  // True while the teacher's question-approval popup is open. The student video stays paused for the
+  // WHOLE popup window (across every question the teacher launches from it), not just per-question.
+  const [teacherVideoPaused, setTeacherVideoPaused] = useState(false)
+
+  useEffect(() => {
+    if (!isVideoMode) return
+    const p = studentPlayerRef.current
+    if (!p) return
+    if (teacherVideoPaused || currentQuestion) {
+      p.pauseVideo?.()
+    } else {
+      // For a live stream, jump back to the live edge on resume so students rejoin the broadcast.
+      // Query the player directly so it fires even if the isLiveStream state hasn't settled.
+      let live = isLiveStream
+      try { const ps = p.getProgressState?.(); if (ps && typeof ps.isLive === 'boolean') live = ps.isLive } catch (e) { /* ignore */ }
+      if (live && typeof p.seekTo === 'function') {
+        const dur = typeof p.getDuration === 'function' ? p.getDuration() : 0
+        p.seekTo(dur > 0 ? dur : 1e7, true)
+        // Suspend the teacher-cap briefly so the student isn't snapped off the live edge before the
+        // teacher's post-jump position broadcast (every 2s) lands and refreshes the ceiling.
+        capSuppressUntilRef.current = performance.now() + 4000
+      }
+      p.playVideo?.()
+    }
+  }, [teacherVideoPaused, currentQuestion, isVideoMode, isLiveStream])
+
 
   useEffect(() => {
     if (!token || !socket) return
@@ -158,9 +195,21 @@ function StudentRoomPage() {
       }
     }
 
+    const handleVideoProgress = (data) => {
+      const t = Number(data?.time)
+      if (!Number.isFinite(t)) return
+      teacherVideoTimeRef.current = { time: t, playing: !!data?.playing, at: performance.now() }
+    }
+
+    const handleVideoPause = () => setTeacherVideoPaused(true)
+    const handleVideoResume = () => setTeacherVideoPaused(false)
+
     socket.on('question:started', handleQuestionStarted)
     socket.on('question:ended', handleQuestionEnded)
     socket.on('new_question', handleNewQuestion)
+    socket.on('video:progress', handleVideoProgress)
+    socket.on('video:pause', handleVideoPause)
+    socket.on('video:resume', handleVideoResume)
     socket.on('connect', handleReconnect)
     socket.on('room:ended', () => {
       // Show the interstitial immediately, but stagger the actual navigation across a jitter window
@@ -176,6 +225,9 @@ function StudentRoomPage() {
       socket.off('question:started', handleQuestionStarted)
       socket.off('question:ended', handleQuestionEnded)
       socket.off('new_question', handleNewQuestion)
+      socket.off('video:progress', handleVideoProgress)
+      socket.off('video:pause', handleVideoPause)
+      socket.off('video:resume', handleVideoResume)
       socket.off('connect', handleReconnect)
       socket.off('room:ended')
       if (resultsNavTimerRef.current) clearTimeout(resultsNavTimerRef.current)
@@ -293,13 +345,9 @@ function StudentRoomPage() {
       const saveData = await saveResponse.json()
       console.log('[StudentRoom] Response saved:', saveData)
 
-      // Phase 1: the server now emits the throttled leaderboard/answer-count updates itself
-      // (from this authenticated POST) — the client no longer emits points:update /
-      // response:submit. The POST returns this student's current rank; surface it so the
-      // leaderboard's "you" pill updates even when outside the broadcast top-N.
-      if (saveData.success && saveData.rank != null) {
-        setMyRank(saveData.rank)
-      }
+      // Phase 1: the server emits the throttled leaderboard/answer-count updates itself from this
+      // authenticated POST — the client no longer emits points:update / response:submit. The
+      // leaderboard (incl. this student's own row) refreshes once per segment, not per submit.
     } catch (err) {
       console.error('Failed to save response:', err)
     }
@@ -485,8 +533,43 @@ function StudentRoomPage() {
             </button>
           </div>
 
-          {/* Live Question */}
-          {currentQuestion ? (
+          {/* Video (video mode) — persistent so it doesn't remount when questions come/go.
+              Hidden (not unmounted) while a question is live so the poll takes over like normal mode. */}
+          {isVideoMode && videoId && (
+            <div style={{
+              display: currentQuestion ? 'none' : 'block',
+              background: 'var(--bg-card)',
+              borderRadius: 'var(--radius-lg)',
+              padding: isMobile ? '12px' : '16px',
+              boxShadow: 'var(--shadow-md)',
+              border: '1px solid var(--border-color)',
+              marginBottom: '24px'
+            }}>
+              {isLiveStream && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#ef4444', animation: 'blink 1s infinite' }} />
+                  <span style={{ fontSize: '12px', color: '#ef4444', fontWeight: 700, letterSpacing: '0.03em' }}>LIVE</span>
+                </div>
+              )}
+              <YouTubeVideo
+                videoId={videoId}
+                controls={true}
+                noForwardSeek={true}
+                seekCeilingRef={teacherVideoTimeRef}
+                capSuppressUntilRef={capSuppressUntilRef}
+                playerRef={studentPlayerRef}
+                onLiveStatus={setIsLiveStream}
+              />
+              <p style={{ margin: '10px 0 0', fontSize: '12px', color: 'var(--text-secondary)', textAlign: 'center' }}>
+                {isLiveStream
+                  ? 'Live stream. You can rewind, and the video pauses automatically during a poll.'
+                  : 'You can pause and rewind, but not skip ahead. The video pauses automatically during a poll.'}
+              </p>
+            </div>
+          )}
+
+          {/* Live Question — only mounted while a poll is live */}
+          {currentQuestion && (
             <div style={{
               background: 'linear-gradient(135deg, #7c3aed, #a855f7)',
               borderRadius: 'var(--radius-lg)',
@@ -638,10 +721,14 @@ function StudentRoomPage() {
                 </button>
               )}
             </div>
-          ) : (
-            /* Waiting State - Show Passed Questions */
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-              {/* Active question area placeholder */}
+          )}
+
+          {/* Waiting State (Show Passed Questions) — persistent: display-toggled, NOT unmounted, so the
+              Leaderboard keeps its socket subscription and updates ONLY on the once-per-segment
+              leaderboard:updated push, instead of re-fetching on every poll's remount. */}
+          <div style={{ display: currentQuestion ? 'none' : 'flex', flexDirection: 'column', gap: '24px' }}>
+              {/* Active question area placeholder — hidden in video mode (the player fills this space) */}
+              {!isVideoMode && (
               <div style={{
                 background: 'var(--bg-card)',
                 borderRadius: 'var(--radius-lg)',
@@ -670,6 +757,7 @@ function StudentRoomPage() {
                   The teacher will start a poll soon. Stay tuned!
                 </p>
               </div>
+              )}
 
               {/* Past Questions (flex) + Leaderboard (flex) */}
               <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', width: '100%', boxSizing: 'border-box' }}>
@@ -698,13 +786,13 @@ function StudentRoomPage() {
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                             <span style={{
                               padding: '2px 10px',
-                              background: q.answered ? '#d1fae5' : '#fee2e2',
-                              color: q.answered ? '#059669' : '#dc2626',
+                              background: q.answered ? '#d1fae5' : (q.resultPending ? '#eff6ff' : '#fee2e2'),
+                              color: q.answered ? '#059669' : (q.resultPending ? '#3b82f6' : '#dc2626'),
                               borderRadius: '6px',
                               fontSize: '12px',
                               fontWeight: '600'
                             }}>
-                              {q.answered ? 'Answered' : 'Missed'}
+                              {q.answered ? 'Answered' : (q.resultPending ? 'Live' : 'Missed')}
                             </span>
                             <span style={{
                               padding: '2px 10px',
@@ -724,10 +812,23 @@ function StudentRoomPage() {
                               fontSize: '12px',
                               fontWeight: '600'
                             }}>
-                              {q.answered ? (q.pointsEarned || 0) : 0}/{q.maxPoints || 100} pts
+                              {q.resultPending ? '—' : (q.answered ? (q.pointsEarned || 0) : 0)}/{q.maxPoints || 100} pts
                             </span>
                           </div>
-                          {q.answered && q.isCorrect && (
+                          {/* Live poll: result withheld until the poll closes — show a neutral badge, never correct/incorrect. */}
+                          {q.resultPending && q.answered && (
+                            <span style={{
+                              padding: '4px 12px',
+                              background: '#3b82f6',
+                              color: 'white',
+                              borderRadius: '6px',
+                              fontSize: '12px',
+                              fontWeight: '600'
+                            }}>
+                              ⏳ Answer submitted
+                            </span>
+                          )}
+                          {!q.resultPending && q.answered && q.isCorrect && (
                             <span style={{
                               padding: '4px 12px',
                               background: '#10b981',
@@ -739,7 +840,7 @@ function StudentRoomPage() {
                               ✓ Correct (+{q.pointsEarned || 0})
                             </span>
                           )}
-                          {q.answered && !q.isCorrect && (
+                          {!q.resultPending && q.answered && !q.isCorrect && (
                             <span style={{
                               padding: '4px 12px',
                               background: '#ef4444',
@@ -761,27 +862,49 @@ function StudentRoomPage() {
                         {/* All options - always shown */}
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
                           {(q.options || []).map((option, optIdx) => {
+                            const pending = !!q.resultPending
                             const isSelected = q.selectedOptions?.includes(optIdx)
                             const isCorrect = option.isCorrect
                             const letter = String.fromCharCode(65 + optIdx)
-                            
+
                             let bgColor = 'var(--bg-secondary)'
                             let borderColor = 'var(--border-color)'
                             let textColor = 'var(--text-primary)'
+                            let letterBg = 'var(--border-color)'
                             let label = ''
-                            
-                            if (q.answered && isSelected && isCorrect) {
+
+                            if (pending) {
+                              // Live poll: NEVER reveal the correct option. Only mark what the student
+                              // picked, in blue — the correct/incorrect result comes after it closes.
+                              if (q.answered && isSelected) {
+                                bgColor = '#eff6ff'
+                                borderColor = '#3b82f6'
+                                letterBg = '#3b82f6'
+                                // The highlight bg is a fixed light pastel, so text must be a dark
+                                // accent (not var(--text-primary), which is white in dark mode and
+                                // would wash out over the pastel). Mirrors the teacher side.
+                                textColor = '#1e40af'
+                                label = ' (Your answer)'
+                              }
+                            } else if (q.answered && isSelected && isCorrect) {
                               bgColor = '#d1fae5'
                               borderColor = '#059669'
+                              letterBg = '#059669'
+                              textColor = '#065f46'
                               label = ' (Your correct answer)'
                             } else if (q.answered && isSelected && !isCorrect) {
                               bgColor = '#fee2e2'
                               borderColor = '#dc2626'
+                              textColor = '#991b1b'
                               label = ' (Your wrong answer)'
                             } else if (!q.answered && isCorrect) {
                               bgColor = '#d1fae5'
                               borderColor = '#059669'
+                              letterBg = '#059669'
+                              textColor = '#065f46'
                               label = ' (Correct answer)'
+                            } else if (isCorrect) {
+                              letterBg = '#059669'
                             }
                             
                             return (
@@ -798,7 +921,7 @@ function StudentRoomPage() {
                                   width: '28px',
                                   height: '28px',
                                   borderRadius: '50%',
-                                  background: isCorrect ? '#059669' : 'var(--border-color)',
+                                  background: letterBg,
                                   color: 'white',
                                   display: 'flex',
                                   alignItems: 'center',
@@ -822,8 +945,13 @@ function StudentRoomPage() {
                           })}
                         </div>
                         
-                        {/* Missed question notice */}
-                        {!q.answered && (
+                        {/* Live poll: result withheld until it closes. Otherwise, missed-question notice. */}
+                        {q.resultPending && (
+                          <p style={{ fontSize: '13px', color: '#3b82f6', margin: 0, fontStyle: 'italic' }}>
+                            ⏳ Result will be shown once this poll closes
+                          </p>
+                        )}
+                        {!q.resultPending && !q.answered && (
                           <p style={{ fontSize: '13px', color: '#dc2626', margin: 0, fontStyle: 'italic' }}>
                             ⚠️ You did not answer this question
                           </p>
@@ -842,11 +970,12 @@ function StudentRoomPage() {
                   <h3 style={{ fontSize: '18px', fontWeight: '600', color: 'var(--text-primary)', marginBottom: '16px' }}>
                     🏆 Leaderboard
                   </h3>
-                  <Leaderboard roomId={room?._id} token={token} socket={socket} userId={user?._id} myRank={myRank} />
+                  <ErrorBoundary message="Leaderboard unavailable">
+                    <Leaderboard roomId={room?._id} token={token} socket={socket} userId={user?._id} />
+                  </ErrorBoundary>
                 </div>
               </div>
             </div>
-          )}
         </div>
       </div>
       {/* ── Fullscreen prompt overlay ──────────────────────────────────────
