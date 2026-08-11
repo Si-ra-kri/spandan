@@ -18,7 +18,10 @@ import RoomResultsPage from './pages/RoomResultsPage'
 import ProfilePage from './pages/ProfilePage'
 import StudentRiskHistory from './pages/StudentRiskHistory'
 import StudentRiskTrend from './pages/StudentRiskTrend'
+import HelpPage from './pages/HelpPage'
+import AdminPage from './pages/AdminPage'
 import { API_URL } from './config.js'
+import { isTokenExpired } from './lib/jwt.js'
 
 // Samagama auto-login has known side effects when a user is ALREADY
 // authenticated into Spandan as a different role (it would clobber
@@ -40,12 +43,16 @@ function App() {
   const { connect, disconnect } = useSocketStore()
   const navigate = useNavigate()
 
+  // On load, drop any expired persisted token immediately.
+  useEffect(() => {
+    const { token: t } = useAuthStore.getState()
+    if (t && isTokenExpired(t)) {
+      useAuthStore.getState().handleSessionExpired()
+    }
+  }, [])
+
   // Check for Samagama session on app load — but only when there is no
-  // existing Spandan session in this browser. Two checks:
-  //   - zustand rehydrated state (isAuthenticated from persist)
-  //   - raw localStorage key (handles the pre-rehydration race)
-  // And we mark a permanent localStorage flag once resolved, so future
-  // tabs on the same browser skip the check entirely.
+  // existing Spandan session in this browser.
   useEffect(() => {
     // Already authenticated via Spandan — nothing to do.
     if (isAuthenticated) return
@@ -102,16 +109,13 @@ function App() {
           return
         }
 
-        // Send to Spandan backend for auto-provisioning
+        // Send the Samagama token to the Spandan backend, which re-verifies it
+        // server-side and provisions the account from the identity Samagama returns.
+        // We deliberately do not send email/name/admin flags — the server does not trust them.
         const spandanResponse = await fetch(`${API_URL}/auth/samagama-auto-login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: samagamaUser.email,
-            name: samagamaUser.name,
-            isAdmin: samagamaUser.isAdmin || false,
-            isSuperAdmin: samagamaUser.isSuperAdmin || false
-          })
+          body: JSON.stringify({ samagamaToken })
         })
 
         if (!spandanResponse.ok) { markResolved(); return }
@@ -210,6 +214,17 @@ function App() {
             <RoomResultsPage />
           </ProtectedRoute>
         } />
+        <Route path="/teacher/help" element={
+          <ProtectedRoute allowedRoles={['teacher']}>
+            <HelpPage />
+          </ProtectedRoute>
+        } />
+        {/* Admin-only: teacher approval page. Guarded to teachers here and to isAdmin inside the page + API. */}
+        <Route path="/admin" element={
+          <ProtectedRoute allowedRoles={['teacher']}>
+            <AdminPage />
+          </ProtectedRoute>
+        } />
         <Route path="/student" element={
           <ProtectedRoute allowedRoles={['student']}>
             <StudentDashboard />
@@ -218,6 +233,11 @@ function App() {
         <Route path="/student/join-room" element={
           <ProtectedRoute allowedRoles={['student']}>
             <JoinRoomPage />
+          </ProtectedRoute>
+        } />
+        <Route path="/student/help" element={
+          <ProtectedRoute allowedRoles={['student']}>
+            <HelpPage />
           </ProtectedRoute>
         } />
         <Route path="/student/room-history" element={
