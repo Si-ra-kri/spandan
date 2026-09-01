@@ -13,6 +13,7 @@ import CreateQuestionOverlay from '../components/CreateQuestionOverlay'
 import TextToQuestionsPopup from '../components/TextToQuestionsPopup'
 import RoomSettingsModal from '../components/RoomSettingsModal'
 import Leaderboard from '../components/Leaderboard'
+import ErrorBoundary from '../components/ErrorBoundary'
 import YouTubeVideo, { extractYouTubeId } from '../components/YouTubeVideo'
 import useIsMobile from '../hooks/useIsMobile'
 import { saveTranscript } from '../services/transcriptService'
@@ -42,13 +43,26 @@ function RoomDetailPage() {
   const [coHostInvite, setCoHostInvite] = useState(null)    // { code, expiresAt, coHostDuration }
   const [coHostInviteLoading, setCoHostInviteLoading] = useState(false)
   const [coHostCodeCopied, setCoHostCodeCopied] = useState(false)
-  // Duration the owner sets for how long a teacher stays a co-host after redeeming the code.
-  // Stored in ms; null = until the session ends (no expiry).
-  const [coHostDuration, setCoHostDuration] = useState(3600000)  // default 1 hour
+  // 'forever' = until meet ends (null ms); 'custom' = owner sets specific time
+  const [coHostValidityMode, setCoHostValidityMode] = useState('forever')
+  const [customDurationValue, setCustomDurationValue] = useState(30)   // number
+  const [customDurationUnit, setCustomDurationUnit] = useState('minutes') // 'minutes' | 'hours'
+
+  // Compute the ms to send to the API: null = until meet ends, otherwise computed from value+unit
+  const getCoHostDurationMs = () => {
+    if (coHostValidityMode === 'forever') return null
+    const ms = customDurationUnit === 'hours'
+      ? customDurationValue * 3600 * 1000
+      : customDurationValue * 60 * 1000
+    return Math.max(ms, 60 * 1000) // minimum 1 minute
+  }
 
   // True when the logged-in teacher is a co-host (not the room owner).
   // Used to show the 'Co-Host' badge and hide owner-only controls.
-  const isCoHost = room && user && room.teacher?._id?.toString() !== user._id?.toString()
+  // cohostExpired is set when the server signals validity has lapsed — the teacher
+  // stays in the room as a regular viewer but loses all host-action buttons.
+  const [cohostExpired, setCohostExpired] = useState(false)
+  const isCoHost = !cohostExpired && room && user && room.teacher?._id?.toString() !== user._id?.toString()
   const settingsRef = useRef(null)
   const transcriptRef = useRef(null)
 
@@ -57,6 +71,12 @@ function RoomDetailPage() {
   const [transcript, setTranscript] = useState('')
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [modelStatus, setModelStatus] = useState('Ready')
+  // Recording mutex: null = nobody recording; {userId, userName} = someone is recording
+  const [recordingLock, setRecordingLock] = useState(null)
+  const recordingLockRef = useRef(null) // ref mirror so startRecording (async) always reads fresh value
+  // Video session controller: null = free; {userId, userName} = that teacher controls the video
+  const [videoLock, setVideoLock] = useState(null)
+  const videoLockRef = useRef(null)
 
   // MediaRecorder refs for server-side Whisper transcription
   const mediaRecorderRef = useRef(null)
@@ -88,6 +108,10 @@ function RoomDetailPage() {
   const [activeQuestion, setActiveQuestion] = useState(null)
   const [questionTimeLeft, setQuestionTimeLeft] = useState(0)
   const questionTimerRef = useRef(null)
+  // Exposed ref so question-launch handlers can start the timer without waiting
+  // for the socket echo — ensures timer runs on the creator's page regardless of
+  // who (host or co-host) saved the question.
+  const startQuestionTimerRef = useRef(null)
 
 
   // Question generation
@@ -163,9 +187,102 @@ function RoomDetailPage() {
     socket.on('room:joined', handleRoomJoined)
     socket.on('room:left', handleRoomLeft)
 
+    // Sync co-host when owner ends the session — redirect to results (same as owner)
+    const handleRoomEnded = (data) => {
+      setRoom(prev => prev ? { ...prev, endedAt: data?.endedAt || new Date().toISOString(), isActive: false } : prev)
+      navigate(`/teacher/room/${roomId}/results`)
+    }
+    socket.on('room:ended', handleRoomEnded)
+
+    // Co-host validity lapsed — demote to viewer (stay in room, lose host buttons)
+    const handleCohostExpired = () => {
+      setCohostExpired(true)
+    }
+    socket.on('cohost:expired', handleCohostExpired)
+
+    // Recording mutex — lock/unlock mic across all host/co-host pages in the room
+    const handleRecordingLocked = (data) => {
+      const lock = { userId: data.userId, userName: data.userName }
+      setRecordingLock(lock)
+      recordingLockRef.current = lock
+    }
+    const handleRecordingUnlocked = () => {
+      setRecordingLock(null)
+      recordingLockRef.current = null
+    }
+    // Server rejected our lock request because someone else is already recording
+    const handleLockRejected = (data) => {
+      setRecordingLock(prev => prev) // keep existing lock display
+      alert(`Cannot start recording: ${data.lockedBy} is currently recording in this room.`)
+    }
+    socket.on('recording:locked', handleRecordingLocked)
+    socket.on('recording:unlocked', handleRecordingUnlocked)
+    socket.on('recording:lock_rejected', handleLockRejected)
+
+    // Video session controller lock — one teacher drives, others follow
+    const handleVideoSessionLocked = (data) => {
+      const lock = { userId: data.userId, userName: data.userName }
+      setVideoLock(lock)
+      videoLockRef.current = lock
+    }
+    const handleVideoSessionUnlocked = () => {
+      setVideoLock(null)
+      videoLockRef.current = null
+    }
+    const handleVideoSessionLockRejected = (data) => {
+      alert(`Cannot start video session: ${data.controlledBy} is already controlling the video in this room.`)
+    }
+    // Non-controller receives transcript text from the controller in real-time
+    const handleTranscriptSync = (data) => {
+      if (!recordingActiveRef.current) {
+        setTranscript(data.text || '')
+      }
+    }
+    // Non-controller syncs player position to controller's video:progress broadcast (every 2s)
+    const handleVideoProgressForSync = (data) => {
+      const amController = videoLockRef.current && videoLockRef.current.userId === String(user?._id)
+      if (!amController && ytPlayerRef.current) {
+        const p = ytPlayerRef.current
+        const cur = typeof p.getCurrentTime === 'function' ? p.getCurrentTime() : 0
+        // Only seek if drift > 3s to avoid constant jitter
+        if (Math.abs(cur - data.time) > 3) p.seekTo?.(data.time, true)
+        if (data.playing && p.getPlayerState?.() !== 1) p.playVideo?.()
+        else if (!data.playing && p.getPlayerState?.() === 1) p.pauseVideo?.()
+      }
+    }
+    // Non-controller's player pauses when controller opens question popup
+    const handleVideoPauseForSync = () => {
+      const amController = videoLockRef.current && videoLockRef.current.userId === String(user?._id)
+      if (!amController) ytPlayerRef.current?.pauseVideo?.()
+    }
+    // Non-controller's player resumes when controller closes question popup
+    const handleVideoResumeForSync = () => {
+      const amController = videoLockRef.current && videoLockRef.current.userId === String(user?._id)
+      if (!amController) ytPlayerRef.current?.playVideo?.()
+    }
+    socket.on('video:session:locked', handleVideoSessionLocked)
+    socket.on('video:session:unlocked', handleVideoSessionUnlocked)
+    socket.on('video:session:lock_rejected', handleVideoSessionLockRejected)
+    socket.on('transcript:sync', handleTranscriptSync)
+    socket.on('video:progress', handleVideoProgressForSync)
+    socket.on('video:pause', handleVideoPauseForSync)
+    socket.on('video:resume', handleVideoResumeForSync)
+
     return () => {
       socket.off('room:joined', handleRoomJoined)
       socket.off('room:left', handleRoomLeft)
+      socket.off('room:ended', handleRoomEnded)
+      socket.off('cohost:expired', handleCohostExpired)
+      socket.off('recording:locked', handleRecordingLocked)
+      socket.off('recording:unlocked', handleRecordingUnlocked)
+      socket.off('recording:lock_rejected', handleLockRejected)
+      socket.off('video:session:locked', handleVideoSessionLocked)
+      socket.off('video:session:unlocked', handleVideoSessionUnlocked)
+      socket.off('video:session:lock_rejected', handleVideoSessionLockRejected)
+      socket.off('transcript:sync', handleTranscriptSync)
+      socket.off('video:progress', handleVideoProgressForSync)
+      socket.off('video:pause', handleVideoPauseForSync)
+      socket.off('video:resume', handleVideoResumeForSync)
     }
   }, [socket])
 
@@ -203,12 +320,17 @@ function RoomDetailPage() {
           clearInterval(questionTimerRef.current)
           questionTimerRef.current = null
           setActiveQuestion(null)
+          // Auto-refresh questions + answer counts when the window closes —
+          // same behaviour the host gets from the popup's onComplete callback.
+          if (room?._id) setTimeout(() => loadQuestions(room._id), 300)
           return 0
         }
         return prev - 1
       })
     }, 1000)
   }
+  // Keep ref in sync so handlers defined after this block can call the latest version
+  startQuestionTimerRef.current = startQuestionTimer
 
   const handleQuestionLaunched = (data) => {
     console.log('[QUESTION LAUNCHED]', data)
@@ -264,18 +386,19 @@ function RoomDetailPage() {
 
 
 
-  // Check server transcription status on mount
+  // Check server transcription status on mount — silently; don't surface
+  // "Server Loading..." or "Server Error" to the teacher since the Python
+  // transcription service is optional and its state is not actionable from the UI.
   const checkServerTranscription = async () => {
     try {
       const status = await getTranscriptionStatus()
       if (status.status === 'ready') {
         setModelStatus('Server Ready')
-      } else {
-        setModelStatus('Server Loading...')
       }
+      // If not ready, leave modelStatus as the default 'Ready' — no confusing message
     } catch (error) {
-      console.error('Failed to check transcription status:', error)
-      setModelStatus('Server Error')
+      // Transcription service unreachable — not an error the teacher needs to see
+      console.info('Transcription service not available:', error.message)
     }
   }
 
@@ -697,6 +820,14 @@ function RoomDetailPage() {
   const startRecording = async ({ resetSegment = true } = {}) => {
     if (recordingActiveRef.current) return
 
+    // Check the recording mutex — refuse immediately if another teacher holds the lock.
+    // Use the ref (not state) so this async function always reads the latest value.
+    const lock = recordingLockRef.current
+    if (lock && lock.userId !== user?._id) {
+      alert(`Cannot start recording: ${lock.userName} is currently recording in this room.`)
+      return
+    }
+
     // Video mode: the tab-audio stream was acquired once by beginVideoSession and persists across
     // segments (getDisplayMedia can't be re-prompted silently). Just (re)start the transcription
     // loop for the next segment; do NOT call getUserMedia/getDisplayMedia here.
@@ -718,9 +849,14 @@ function RoomDetailPage() {
     }
 
     try {
-      // Request microphone access
+      // Request microphone access — stream is requested fresh each recording session
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current = stream
+
+      // Emit recording lock to all room members (including self via server broadcast)
+      if (socket && isConnected && room?.code) {
+        socket.emit('recording:lock', { roomCode: room.code })
+      }
 
       // Initialize MediaRecorder - try OGG first as it handles chunking better than WebM
       let selectedMimeType = 'audio/ogg'
@@ -770,6 +906,17 @@ function RoomDetailPage() {
   const stopRecording = async () => {
     recordingActiveRef.current = false
 
+    // ── Update UI immediately so the button feels instant ──────────────────
+    setIsRecording(false)
+    setIsTranscribing(false)
+    setModelStatus('Ready')
+
+    // Release the recording lock right away so other teachers can start
+    if (socket && isConnected && room?.code) {
+      socket.emit('recording:unlock', { roomCode: room.code })
+    }
+
+    // ── Background cleanup (doesn't block the UI) ───────────────────────────
     // Stop the current 10-second recorder window.
     if (transcriptionIntervalRef.current) {
       clearTimeout(transcriptionIntervalRef.current)
@@ -791,18 +938,14 @@ function RoomDetailPage() {
     await processTranscriptionQueue()
 
     // Stop all tracks
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop())
-        streamRef.current = null
-      }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+      streamRef.current = null
+    }
 
     if (segmentTimerRef.current) {
       clearInterval(segmentTimerRef.current)
     }
-
-    setIsRecording(false)
-    setIsTranscribing(false)
-    setModelStatus('Ready')
   }
 
   const toggleRecording = () => {
@@ -853,6 +996,40 @@ function RoomDetailPage() {
   // the current broadcast instead of falling behind by the poll + answer time. We query the player
   // DIRECTLY (not the React isLiveStream state) so this fires reliably even if live-detection state
   // hasn't settled or was captured stale by an older closure.
+  // Tell the server a question pop-up just closed (a segment's questions are answered) so it folds
+  // that segment into the ranked leaderboard (per-segment). A REST call (owner-authed), fired in ALL
+  // modes — unlike video:resume, which is video-mode only — so the board updates for normal sessions.
+  const emitSegmentDone = () => {
+    if (!room?._id || !token) return
+    fetch(`${API_URL}/responses/leaderboard/${room._id}/segment-done`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    }).catch(() => {})
+  }
+
+  // Single source of truth for the per-segment leaderboard fold: fire it whenever ANY question
+  // pop-up (approval / Paste&Generate / Create-Q) goes from open -> closed, by ANY path — the last
+  // question's timer auto-closing it, rejecting the last question, or the teacher closing it
+  // manually. Guarantees the update fires exactly once per close and can't be bypassed by a
+  // particular close path.
+  const approvalPopupWasOpenRef = useRef(false)
+  const textPopupWasOpenRef = useRef(false)
+  const createPopupWasOpenRef = useRef(false)
+  useEffect(() => {
+    const open = showQuestionPopup && pendingQuestions.length > 0
+    if (approvalPopupWasOpenRef.current && !open) emitSegmentDone()
+    approvalPopupWasOpenRef.current = open
+  }, [showQuestionPopup, pendingQuestions])
+  useEffect(() => {
+    const open = showTextQuestionPopup && pendingTextQuestions.length > 0
+    if (textPopupWasOpenRef.current && !open) emitSegmentDone()
+    textPopupWasOpenRef.current = open
+  }, [showTextQuestionPopup, pendingTextQuestions])
+  useEffect(() => {
+    if (createPopupWasOpenRef.current && !showCreateQuestion) emitSegmentDone()
+    createPopupWasOpenRef.current = showCreateQuestion
+  }, [showCreateQuestion])
+
   const resumeTeacherVideo = () => {
     // Tell students the popup window is over so they resume + jump to the live edge (fire even if the
     // teacher's own player ref isn't ready).
@@ -888,6 +1065,14 @@ function RoomDetailPage() {
   // across the whole segment loop — unlike the mic path, which can re-acquire silently each segment.
   const beginVideoSession = async () => {
     if (isEnded || videoSessionActive) return
+
+    // Refuse if another teacher already holds the video controller lock
+    const vl = videoLockRef.current
+    if (vl && vl.userId !== String(user?._id)) {
+      alert(`Cannot start session: ${vl.userName} is already controlling the video in this room.`)
+      return
+    }
+
     try {
       // preferCurrentTab makes the browser's share picker default to THIS tab (and drop the
       // window/screen chooser), so the teacher just clicks "Share" once instead of hunting for the
@@ -902,10 +1087,13 @@ function RoomDetailPage() {
       }
       display.getVideoTracks().forEach(t => t.stop()) // only the audio is needed
       const stream = new MediaStream(audioTracks)
-      // If the teacher stops sharing via the browser UI, end the capture session.
+      // If the teacher stops sharing via the browser UI, end the capture session and release lock.
       audioTracks[0].addEventListener('ended', () => {
         setVideoSessionActive(false)
         stopRecording()
+        if (socket && isConnected && room?.code) {
+          socket.emit('video:session:unlock', { roomCode: room.code })
+        }
       })
       streamRef.current = stream
 
@@ -923,6 +1111,11 @@ function RoomDetailPage() {
       setCurrentSegment(1)
       setVideoSessionActive(true)
       setModelStatus('Ready - press play to begin')
+
+      // Acquire the video controller lock — broadcast to co-hosts that this teacher controls video
+      if (socket && isConnected && room?.code) {
+        socket.emit('video:session:lock', { roomCode: room.code })
+      }
 
       // If the video is already playing, begin capturing immediately.
       if (ytPlayerRef.current?.getPlayerState?.() === 1) {
@@ -993,6 +1186,16 @@ function RoomDetailPage() {
     socket.emit('video:pause', { roomCode: room.code })
   }, [showQuestionPopup, isVideoMode, socket, room?.code])
 
+  // Broadcast the running transcript to other teacher pages in the room so the non-controller
+  // sees the live transcription without doing their own audio capture.
+  // Only the video controller emits this; non-controllers receive via handleTranscriptSync.
+  useEffect(() => {
+    if (!isRecording || !socket || !isConnected || !room?.code) return
+    const amController = videoLockRef.current && videoLockRef.current.userId === String(user?._id)
+    if (!amController) return
+    socket.emit('transcript:sync', { roomCode: room.code, text: transcript })
+  }, [transcript])
+
   const clearTranscript = () => {
     setTranscript('')
     finalTranscriptRef.current = ''
@@ -1058,7 +1261,11 @@ function RoomDetailPage() {
         const data = await response.json()
         setGeneratedQuestions(prev => [data.question, ...prev])
 
-        // Emit to students via socket
+        // Start the timer immediately on this page (host or co-host),
+        // don't wait for the socket echo which may be delayed or rejected.
+        startQuestionTimerRef.current?.(data.question)
+
+        // Emit to all room members via socket
         if (socket && isConnected) {
           socket.emit('new_question', {
             roomCode: room.code,
@@ -1101,6 +1308,9 @@ function RoomDetailPage() {
         const data = await response.json()
         setGeneratedQuestions(prev => [data.question, ...prev])
 
+        // Start the timer immediately on this page
+        startQuestionTimerRef.current?.(data.question)
+
         if (socket && isConnected) {
           socket.emit('new_question', {
             roomCode: room.code,
@@ -1120,6 +1330,7 @@ function RoomDetailPage() {
   const handleTextQuestionClose = () => {
     setShowTextQuestionPopup(false)
     setPendingTextQuestions([])
+    // leaderboard fold fires via the pop-up-close watcher (textPopupWasOpenRef) on close
   }
 
   const handleCreateQuestion = async (questionData) => {
@@ -1144,6 +1355,9 @@ function RoomDetailPage() {
       if (response.ok) {
         const data = await response.json()
         setGeneratedQuestions(prev => [data.question, ...prev])
+
+        // Start the timer immediately on this page
+        startQuestionTimerRef.current?.(data.question)
 
         // Emit to socket for students to receive (include roomCode)
         console.log('Emitting new_question event:', { roomCode: room.code, question: data.question })
@@ -1248,6 +1462,20 @@ function RoomDetailPage() {
                     flexShrink: 0
                   }}>👥 Co-Host</span>
                 )}
+                {cohostExpired && (
+                  <span style={{
+                    background: 'rgba(245,158,11,0.15)',
+                    color: '#b45309',
+                    border: '1px solid rgba(245,158,11,0.4)',
+                    borderRadius: '20px',
+                    padding: '3px 11px',
+                    fontSize: '11px',
+                    fontWeight: '700',
+                    whiteSpace: 'nowrap',
+                    letterSpacing: '0.5px',
+                    flexShrink: 0
+                  }}>⏰ Co-host access expired</span>
+                )}
               </div>
             </div>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
@@ -1330,7 +1558,7 @@ function RoomDetailPage() {
                     const res = await fetch(`${API_URL}/rooms/${room._id}/cohost-invite`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                      body: JSON.stringify({ coHostDuration })
+                      body: JSON.stringify({ coHostDuration: getCoHostDurationMs() })
                     })
                     const data = await res.json()
                     if (res.ok) setCoHostInvite(data)
@@ -1433,8 +1661,8 @@ function RoomDetailPage() {
               </div>
             )}
 
-            {/* Paste & Generate Button — owner only, co-hosts cannot alter transcripts */}
-            {!isEnded && !isCoHost && (
+            {/* Paste & Generate Button — host and co-hosts can both generate questions */}
+            {!isEnded && (
               <button
                 onClick={() => { setPastedText(''); setShowTextToQuestions(true) }}
                 style={{
@@ -1522,18 +1750,21 @@ function RoomDetailPage() {
               />
             </div>
 
-            {/* End Room Button */}
-            {!isEnded && (
-              <button onClick={handleEndRoom} style={{
-                padding: '8px 16px',
-                background: '#ef4444',
-                color: 'white',
-                border: 'none',
-                borderRadius: '8px',
-                fontSize: '14px',
-                fontWeight: '600',
-                cursor: 'pointer'
-              }}>
+            {/* End Room Button — owner only */}
+            {!isEnded && !isCoHost && (
+              <button
+                onClick={handleEndRoom}
+                style={{
+                  padding: '8px 16px',
+                  background: '#ef4444',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '8px',
+                  fontSize: '14px',
+                  fontWeight: '600',
+                  cursor: 'pointer'
+                }}
+              >
                 End Room
               </button>
             )}
@@ -1651,88 +1882,124 @@ function RoomDetailPage() {
                       Invalid YouTube link for this room.
                     </div>
                   )}
+                  {/* Video controller status badge */}
+                  {videoLock && videoLock.userId !== String(user?._id) && (
+                    <div style={{
+                      display: 'flex', alignItems: 'center', gap: '6px',
+                      marginTop: '8px', padding: '6px 10px',
+                      background: 'rgba(245,158,11,0.12)', borderRadius: '8px'
+                    }}>
+                      <span style={{ fontSize: '14px' }}>🎬</span>
+                      <span style={{ fontSize: '12px', color: '#b45309', fontWeight: 600 }}>
+                        Following {videoLock.userName}'s video
+                      </span>
+                    </div>
+                  )}
                   {videoId && !videoSessionActive && (
-                    <button
-                      onClick={beginVideoSession}
-                      disabled={isEnded}
-                      style={{
-                        width: '100%',
-                        marginTop: '12px',
-                        padding: '11px 16px',
-                        background: isEnded ? '#9ca3af' : 'var(--accent-gradient)',
-                        color: '#fff',
-                        border: 'none',
-                        borderRadius: 'var(--radius)',
-                        fontSize: '13px',
-                        fontWeight: 600,
-                        cursor: isEnded ? 'not-allowed' : 'pointer'
-                      }}
-                    >
-                      Start Session (share this tab's audio)
-                    </button>
+                    (() => {
+                      const lockedByOther = videoLock && videoLock.userId !== String(user?._id)
+                      const btnDisabled = isEnded || lockedByOther
+                      return (
+                        <button
+                          onClick={beginVideoSession}
+                          disabled={btnDisabled}
+                          title={lockedByOther ? `${videoLock.userName} is controlling the video` : undefined}
+                          style={{
+                            width: '100%',
+                            marginTop: '12px',
+                            padding: '11px 16px',
+                            background: btnDisabled ? '#9ca3af' : 'var(--accent-gradient)',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: 'var(--radius)',
+                            fontSize: '13px',
+                            fontWeight: 600,
+                            opacity: lockedByOther ? 0.6 : 1,
+                            cursor: btnDisabled ? 'not-allowed' : 'pointer'
+                          }}
+                        >
+                          {lockedByOther
+                            ? `${videoLock.userName} is controlling`
+                            : 'Start Session (share this tab\'s audio)'}
+                        </button>
+                      )
+                    })()
                   )}
                   <p style={{ margin: '10px 0 0', fontSize: '12px', color: 'var(--text-secondary)', textAlign: 'center' }}>
                     {videoSessionActive
                       ? (isTranscribing ? 'Listening to tab audio...' : 'Session ready - press play to capture.')
-                      : 'Share this tab's audio, then play the video to capture the lecture.'}
+                      : "Share this tab's audio, then play the video to capture the lecture."}
                     {'  '}{modelStatus}
                   </p>
                 </div>
               )}
 
-              {/* Mic controls (normal mode) — disabled for co-hosts */}
+              {/* Mic controls (normal mode) */}
               {!isVideoMode && (
               <>
-              {/* Mic Button — disabled for co-hosts (they cannot record/transcribe) */}
-              <button
-                onClick={isCoHost ? undefined : toggleRecording}
-                disabled={isEnded || isCoHost}
-                title={isCoHost ? 'Recording is only available to the room owner' : undefined}
-                style={{
-                  width: '80px',
-                  height: '80px',
-                  borderRadius: '50%',
-                  background: (isEnded || isCoHost)
-                    ? 'linear-gradient(135deg, #6b7280, #9ca3af)'
-                    : (isRecording
-                        ? 'linear-gradient(135deg, #dc2626, #ef4444)'
-                        : 'linear-gradient(135deg, #10b981, #059669)'),
-                  color: 'white',
-                  border: 'none',
-                  cursor: (isEnded || isCoHost) ? 'not-allowed' : 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: '32px',
-                  boxShadow: isRecording
-                    ? '0 0 30px rgba(239, 68, 68, 0.5)'
-                    : '0 8px 25px rgba(16, 185, 129, 0.4)',
-                  transform: isRecording ? 'scale(1.05)' : 'scale(1)',
-                  transition: 'all 0.3s ease'
-                }}
-              >
-                {isRecording ? (
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="white">
-                    <rect x="6" y="6" width="12" height="12" rx="2"/>
-                  </svg>
-                ) : (
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                    <line x1="12" x2="12" y1="19" y2="22"/>
-                  </svg>
-                )}
-              </button>
+              {/* Derive lock state relative to the current user */}
+              {(() => {
+                const lockedByOther = recordingLock && recordingLock.userId !== user?._id
+                const micDisabled = isEnded || lockedByOther
 
-              {/* Status Text */}
-              <div style={{ textAlign: 'center' }}>
-                <p style={{ margin: 0, fontSize: '16px', fontWeight: '600', color: (isRecording && !isCoHost) ? '#ef4444' : 'var(--text-primary)' }}>
-                  {isCoHost ? 'Not available' : (isTranscribing ? 'Listening...' : (isRecording ? 'Recording...' : 'Start Recording'))}
-                </p>
-                <p style={{ margin: '4px 0 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                  {modelStatus}
-                </p>
-              </div>
+                return (
+                  <>
+                  {/* Mic Button */}
+                  <button
+                    onClick={toggleRecording}
+                    disabled={micDisabled}
+                    title={lockedByOther ? `${recordingLock.userName} is currently recording` : undefined}
+                    style={{
+                      width: '80px',
+                      height: '80px',
+                      borderRadius: '50%',
+                      background: micDisabled && !isRecording
+                        ? 'linear-gradient(135deg, #6b7280, #9ca3af)'
+                        : (isRecording
+                            ? 'linear-gradient(135deg, #dc2626, #ef4444)'
+                            : 'linear-gradient(135deg, #10b981, #059669)'),
+                      color: 'white',
+                      border: 'none',
+                      cursor: micDisabled ? 'not-allowed' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: '32px',
+                      opacity: lockedByOther ? 0.6 : 1,
+                      boxShadow: isRecording
+                        ? '0 0 30px rgba(239, 68, 68, 0.5)'
+                        : '0 8px 25px rgba(16, 185, 129, 0.4)',
+                      transform: isRecording ? 'scale(1.05)' : 'scale(1)',
+                      transition: 'all 0.3s ease'
+                    }}
+                  >
+                    {isRecording ? (
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="white">
+                        <rect x="6" y="6" width="12" height="12" rx="2"/>
+                      </svg>
+                    ) : (
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" x2="12" y1="19" y2="22"/>
+                      </svg>
+                    )}
+                  </button>
+
+                  {/* Status Text */}
+                  <div style={{ textAlign: 'center' }}>
+                    <p style={{ margin: 0, fontSize: '16px', fontWeight: '600', color: isRecording ? '#ef4444' : lockedByOther ? '#f59e0b' : 'var(--text-primary)' }}>
+                      {lockedByOther
+                        ? `${recordingLock.userName} is recording`
+                        : (isTranscribing ? 'Listening...' : (isRecording ? 'Recording...' : 'Start Recording'))}
+                    </p>
+                    <p style={{ margin: '4px 0 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                      {lockedByOther ? 'Mic unavailable' : modelStatus}
+                    </p>
+                  </div>
+                  </>
+                )
+              })()}
 
               {/* Live indicator */}
               {isRecording && (
@@ -2039,7 +2306,9 @@ function RoomDetailPage() {
                   Leaderboard
                 </span>
               </div>
-              <Leaderboard roomId={room?._id} token={token} socket={socket} />
+              <ErrorBoundary message="Leaderboard unavailable">
+                <Leaderboard roomId={room?._id} token={token} socket={socket} />
+              </ErrorBoundary>
             </div>
           </div>
         </div>
@@ -2072,6 +2341,7 @@ function RoomDetailPage() {
             // Resume recording for next segment
             startRecording({ resetSegment: false })
             if (isVideoMode) resumeTeacherVideo() // resume the video (live: jump to live edge) after review
+            // leaderboard fold fires via the pop-up-close watcher (approvalPopupWasOpenRef) on close
 
             // Timer will auto-start via the useEffect since isPendingReview is now false
           }}
@@ -2088,6 +2358,7 @@ function RoomDetailPage() {
             setSegmentTimeLeft(roomSettings.segmentTime * 60)
             startRecording({ resetSegment: false })
             if (isVideoMode) resumeTeacherVideo() // resume the video (live: jump to live edge) after review
+            // leaderboard fold fires via the pop-up-close watcher (approvalPopupWasOpenRef) on close
           }}
         />
       )}
@@ -2195,33 +2466,104 @@ function RoomDetailPage() {
               >✕</button>
             </div>
 
-            {/* Duration picker — owner sets how long the co-host relationship lasts */}
+            {/* Duration picker — two clear options */}
             <div style={{ marginBottom: '20px', textAlign: 'left' }}>
-              <label style={{ fontSize: '12px', fontWeight: '700', color: 'var(--text-secondary)', letterSpacing: '0.5px', textTransform: 'uppercase', display: 'block', marginBottom: '8px' }}>
+              <label style={{ fontSize: '12px', fontWeight: '700', color: 'var(--text-secondary)', letterSpacing: '0.5px', textTransform: 'uppercase', display: 'block', marginBottom: '10px' }}>
                 Co-host valid for
               </label>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-                {[
-                  { label: '30 min', value: 30 * 60 * 1000 },
-                  { label: '1 hour', value: 60 * 60 * 1000 },
-                  { label: '2 hours', value: 2 * 60 * 60 * 1000 },
-                  { label: '4 hours', value: 4 * 60 * 60 * 1000 },
-                  { label: 'Until session ends', value: null }
-                ].map(opt => (
-                  <button
-                    key={opt.label}
-                    onClick={() => setCoHostDuration(opt.value)}
-                    style={{
-                      padding: '6px 12px', borderRadius: '8px', fontSize: '12px', fontWeight: '600',
-                      cursor: 'pointer', transition: 'all 0.15s ease',
-                      background: coHostDuration === opt.value ? '#7c3aed' : 'var(--bg-primary)',
-                      color: coHostDuration === opt.value ? '#fff' : 'var(--text-secondary)',
-                      border: coHostDuration === opt.value ? '2px solid #7c3aed' : '2px solid var(--border-color)'
-                    }}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+
+                {/* Option 1: Until meet ends */}
+                <div
+                  onClick={() => setCoHostValidityMode('forever')}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '12px',
+                    padding: '12px 14px', borderRadius: '10px', cursor: 'pointer',
+                    border: coHostValidityMode === 'forever' ? '2px solid #7c3aed' : '2px solid var(--border-color)',
+                    background: coHostValidityMode === 'forever' ? 'rgba(124,58,237,0.08)' : 'var(--bg-primary)',
+                    transition: 'all 0.15s ease'
+                  }}
+                >
+                  <div style={{
+                    width: '18px', height: '18px', borderRadius: '50%', flexShrink: 0,
+                    border: coHostValidityMode === 'forever' ? '5px solid #7c3aed' : '2px solid var(--border-color)',
+                    background: 'var(--bg-primary)', transition: 'all 0.15s ease'
+                  }} />
+                  <div>
+                    <div style={{ fontSize: '13px', fontWeight: '700', color: 'var(--text-primary)' }}>🔁 Until meet ends</div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>Co-host access lasts for the entire meeting</div>
+                  </div>
+                </div>
+
+                {/* Option 2: Custom duration */}
+                <div
+                  onClick={() => setCoHostValidityMode('custom')}
+                  style={{
+                    display: 'flex', flexDirection: 'column', gap: '10px',
+                    padding: '12px 14px', borderRadius: '10px', cursor: 'pointer',
+                    border: coHostValidityMode === 'custom' ? '2px solid #7c3aed' : '2px solid var(--border-color)',
+                    background: coHostValidityMode === 'custom' ? 'rgba(124,58,237,0.08)' : 'var(--bg-primary)',
+                    transition: 'all 0.15s ease'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{
+                      width: '18px', height: '18px', borderRadius: '50%', flexShrink: 0,
+                      border: coHostValidityMode === 'custom' ? '5px solid #7c3aed' : '2px solid var(--border-color)',
+                      background: 'var(--bg-primary)', transition: 'all 0.15s ease'
+                    }} />
+                    <div>
+                      <div style={{ fontSize: '13px', fontWeight: '700', color: 'var(--text-primary)' }}>⏱ Custom duration</div>
+                      <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>Set exactly how long they stay as co-host</div>
+                    </div>
+                  </div>
+
+                  {/* Number + unit picker — only shown when custom is selected */}
+                  {coHostValidityMode === 'custom' && (
+                    <div
+                      onClick={e => e.stopPropagation()} // don't re-trigger the card click
+                      style={{ display: 'flex', gap: '8px', alignItems: 'center', paddingLeft: '30px' }}
+                    >
+                      <input
+                        type="number"
+                        min={1}
+                        max={customDurationUnit === 'hours' ? 24 : 59}
+                        value={customDurationValue}
+                        onChange={e => {
+                          const v = Math.max(1, parseInt(e.target.value) || 1)
+                          setCustomDurationValue(v)
+                        }}
+                        style={{
+                          width: '72px', padding: '8px 10px', fontSize: '16px', fontWeight: '700',
+                          border: '1px solid var(--border)', borderRadius: '8px',
+                          background: 'var(--bg-primary)', color: 'var(--text-primary)',
+                          outline: 'none', textAlign: 'center'
+                        }}
+                      />
+                      <select
+                        value={customDurationUnit}
+                        onChange={e => setCustomDurationUnit(e.target.value)}
+                        style={{
+                          padding: '8px 10px', fontSize: '13px', fontWeight: '600',
+                          border: '1px solid var(--border)', borderRadius: '8px',
+                          background: 'var(--bg-primary)', color: 'var(--text-primary)',
+                          outline: 'none', cursor: 'pointer'
+                        }}
+                      >
+                        <option value="minutes">Minutes</option>
+                        <option value="hours">Hours</option>
+                      </select>
+                      <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                        = {customDurationUnit === 'hours'
+                          ? `${customDurationValue}h`
+                          : customDurationValue >= 60
+                            ? `${Math.floor(customDurationValue / 60)}h ${customDurationValue % 60 > 0 ? (customDurationValue % 60) + 'm' : ''}`
+                            : `${customDurationValue}m`}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
               </div>
             </div>
 
@@ -2265,7 +2607,7 @@ function RoomDetailPage() {
                       const res = await fetch(`${API_URL}/rooms/${room._id}/cohost-invite`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                        body: JSON.stringify({ coHostDuration })
+                        body: JSON.stringify({ coHostDuration: getCoHostDurationMs() })
                       })
                       const data = await res.json()
                       if (res.ok) setCoHostInvite(data)
