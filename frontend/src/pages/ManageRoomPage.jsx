@@ -12,13 +12,12 @@ function ManageRoomPage() {
   const navigate = useNavigate()
   const isMobile = useIsMobile()
   const { user, token } = useAuthStore()
-  const { rooms, isLoading, fetchRooms, deleteRoom, setAuthToken } = useRoomStore()
+  const { rooms, coHostRooms = [], isLoading, fetchRooms, deleteRoom, setAuthToken } = useRoomStore()
 
   useEffect(() => {
     if (token) {
       setAuthToken(token)
       fetchRooms()
-      fetchCoHostRooms()
     }
   }, [token])
 
@@ -39,6 +38,8 @@ function ManageRoomPage() {
 
   // Filter only active rooms (not ended)
   const activeRooms = rooms?.filter(r => !r.endedAt) || []
+  // Co-hosted rooms — only show active ones; ended sessions appear in Room History
+  const activeCoHostRooms = coHostRooms?.filter(r => !r.endedAt) || []
 
   return (
     <div style={{
@@ -272,18 +273,18 @@ function ManageRoomPage() {
           )}
 
           {/* Co-hosting section */}
-          {coHostRooms.length > 0 && (
+          {activeCoHostRooms.length > 0 && (
             <>
               <div style={{ display: 'flex', alignItems: 'baseline', gap: '12px', marginTop: '36px', marginBottom: '20px', flexWrap: 'wrap' }}>
                 <h2 style={{ margin: 0, fontSize: isMobile ? '17px' : '18px', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em', display: 'flex', alignItems: 'center', gap: '8px' }}>
                   🤝 Co-hosting
                   <span style={{ fontSize: '12px', fontWeight: 500, background: '#7c3aed', color: 'white', borderRadius: '999px', padding: '2px 10px' }}>
-                    {coHostRooms.length}
+                    {activeCoHostRooms.length}
                   </span>
                 </h2>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fill, minmax(280px, 1fr))', gap: '16px' }}>
-                {coHostRooms.map((room) => (
+                {activeCoHostRooms.map((room) => (
                   <div
                     key={room._id}
                     onClick={() => navigate(`/teacher/room/${room._id}`)}
