@@ -247,7 +247,7 @@ export const isRoomHost = (room, userId) => {
   })
 }
 
-const CO_HOST_MAX = 3
+const CO_HOST_MAX = 5
 
 /**
  * Returns rooms where userId is an active (non-expired) co-host.
